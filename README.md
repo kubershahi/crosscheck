@@ -77,7 +77,8 @@ python scripts/fetch_corpus.py --ticker AAPL
 # python scripts/fetch_corpus.py --transcripts-only --force
 
 # 2) Chunk → JSONL under data/chunks/{year}/{TICKER}/
-python scripts/build_chunks.py --ticker AAPL
+python scripts/build_chunks.py              # all companies in manifest
+# python scripts/build_chunks.py --ticker AAPL
 
 # 3) Spot-check random chunks + metadata
 python scripts/sanity_chunks.py --ticker AAPL
