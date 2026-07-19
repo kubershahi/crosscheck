@@ -1,0 +1,17 @@
+# Install: pip install -r requirements.txt
+# Or editable package: pip install -e .
+
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.0
+
+# Day 2+ (uncomment when needed)
+# sentence-transformers
+# faiss-cpu
+# rank_bm25
+# instructor
+# anthropic
+# streamlit

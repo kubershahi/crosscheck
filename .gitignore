@@ -216,3 +216,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local data (keep placeholders and manifests; raw corpus / chunks stay local)
+data/raw/filings/**
+data/raw/transcripts/**
+data/chunks/**
+!data/chunks/.gitkeep
+!data/manifests/
+!data/manifests/**
+
+# OS
+.DS_Store
+
+# Cursor Files
+.cursorrules
+
+# Markdown Files
+earnings-rag-blueprint.md
