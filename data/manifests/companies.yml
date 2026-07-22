@@ -3,6 +3,7 @@
 #
 # name: colloquial name people know (stored on every chunk as company_name)
 # form: null → auto (Q4 → 10-K, Q1–Q3 → 10-Q)
+# include: true → fetch/chunk by default; false → skipped unless --ticker is passed
 
 companies:
   - ticker: AAPL
@@ -10,6 +11,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: true
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/31/apple-q4-2025-earnings-call-transcript/"
 
   - ticker: MSFT
@@ -17,6 +19,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: true
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/05/microsoft-msft-q4-2025-earnings-call-transcript/"
 
   - ticker: NVDA
@@ -24,6 +27,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: true
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/nvidia-nvda-q4-2025-earnings-call-transcript/"
 
   - ticker: GOOGL
@@ -31,6 +35,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: true
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/04/alphabet-googl-q4-2025-earnings-call-transcript/"
 
   - ticker: META
@@ -38,6 +43,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: true
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/meta-meta-q4-2025-earnings-call-transcript/"
 
   - ticker: AMZN
@@ -45,6 +51,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/05/amazon-amzn-q4-2025-earnings-call-transcript/"
 
   - ticker: TSLA
@@ -52,6 +59,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/tesla-tsla-q4-2025-earnings-call-transcript/"
 
   - ticker: AVGO
@@ -59,6 +67,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/12/12/broadcom-avgo-q4-2025-earnings-call-transcript/"
 
   - ticker: ORCL
@@ -66,6 +75,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.tickertrends.io/transcripts/ORCL/Q4-earnings-transcript-2025"
 
   - ticker: AMD
@@ -73,6 +83,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/03/amd-amd-q4-2025-earnings-call-transcript/"
 
   - ticker: JPM
@@ -80,6 +91,7 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/15/j-p-morgan-chase-jpm-q4-2025-earnings-call-transcript/"
 
   - ticker: CRM
@@ -87,4 +99,5 @@ companies:
     fiscal_year: 2025
     fiscal_quarter: 4
     form: null
+    include: false
     transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/salesforce-crm-q4-2025-earnings-call-transcript/"

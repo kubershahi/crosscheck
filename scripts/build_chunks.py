@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Chunk raw filings + transcripts and write JSONL under data/chunks/{year}/.
-
-Periods come only from ``data/manifests/companies.yml`` (no hardcoded fallbacks).
+"""Chunk raw filing/transcript pairs and write JSONL under data/chunks/{year}/.
 
 Examples::
 
-    # Chunk every company-period in the manifest
+    # Every complete filing/transcript pair currently under data/raw
     python scripts/build_chunks.py
 
-    # One (or more) tickers
+    # One ticker or a comma-separated subset
     python scripts/build_chunks.py --ticker AAPL
-    python scripts/build_chunks.py --ticker AAPL --ticker MSFT
+    python scripts/build_chunks.py --ticker AAPL,MSFT,NVDA
 
 Output::
 
-    data/chunks/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_filing.jsonl
+    data/chunks/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_10-K.jsonl   # or 10-Q
     data/chunks/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_transcript.jsonl
 """
 
@@ -29,46 +27,54 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.chunking.pipeline import (  # noqa: E402
     build_chunks_for_period,
-    periods_from_manifest,
+    discover_raw_periods,
 )
 from crosscheck.models import Chunk  # noqa: E402
+
+
+def _parse_tickers(value: str | None) -> list[str] | None:
+    """Expand ``--ticker AAPL,MSFT`` into a normalized ticker list."""
+    if value is None:
+        return None
+    return list(dict.fromkeys(part.strip().upper() for part in value.split(",") if part.strip()))
 
 
 def _summary(chunks: list[Chunk], label: str) -> None:
     """Print a one-line summary of chunk counts / speakers / sections."""
     n_tables = sum(1 for c in chunks if c.is_table)
     speakers = sorted({c.speaker_name for c in chunks if c.speaker_name})
-    sections = sorted({c.section_header for c in chunks if c.section_header})
+    sections = sorted({c.section for c in chunks if c.section})
     print(f"  {label}: {len(chunks)} chunks", end="")
     if n_tables:
         print(f" ({n_tables} tables)", end="")
     if speakers:
         print(f" | speakers={len(speakers)}", end="")
-    if sections and label == "filing":
-        print(f" | sections≈{min(len(sections), 8)} shown later", end="")
+    if sections and label != "transcript":
+        print(f" | sections≈{min(len(sections), 8)}", end="")
     print()
     if speakers:
         print(f"    speakers: {', '.join(speakers[:10])}" + (" …" if len(speakers) > 10 else ""))
-    if sections and label == "filing":
+    if sections and label != "transcript":
         print(f"    sample sections: {', '.join(sections[:6])}" + (" …" if len(sections) > 6 else ""))
 
 
 def main() -> None:
-    """CLI entry: chunk manifest periods and write JSONL."""
+    """CLI entry: discover and chunk requested raw ticker data."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--ticker",
-        action="append",
-        dest="tickers",
-        help="Only chunk this ticker (repeatable). Default: all rows in the manifest.",
+        help="Optional ticker or comma-separated subset (e.g. AAPL,MSFT).",
     )
     args = parser.parse_args()
+    tickers = _parse_tickers(args.ticker)
+    if args.ticker is not None and not tickers:
+        parser.error("--ticker must contain at least one ticker")
 
     try:
-        periods = periods_from_manifest(tickers=args.tickers)
+        periods = discover_raw_periods(tickers=tickers)
     except ValueError as exc:
         print(exc)
         sys.exit(1)

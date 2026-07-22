@@ -1,12 +1,18 @@
 """Speaker-turn chunking for earnings-call transcript plain text.
 
 Splits cleaned Motley Fool / IR transcripts on speaker headers
-(``Name -- Title``, ``Name:``, ``Operator:``, …) and tags prepared remarks
-vs Q&A when detectable.
+(``Name -- Title``, ``Name:``, ``Operator:``, …).
 
 Preamble blocks (Date, Call participants, Industry glossary) stay in the
-``.txt`` for humans / meta but are not turned into chunks. Participant titles
-from that roster are attached to later turns as ``speaker_title``.
+``.txt`` for humans / meta but are **not** turned into chunks:
+
+- Date / call time belong in sidecar metadata
+- Call participants are parsed into the roster so later turns get ``speaker_role``
+- Industry glossary is Motley Fool editorial noise for retrieval / claims
+
+``section`` (Prepared Remarks vs Q&A) is best-effort metadata only. Downstream
+claim extraction and retrieval key off ``speaker_role`` and document order, not
+section labels — so imperfect transitions on new transcripts are low risk.
 """
 
 from __future__ import annotations
@@ -21,9 +27,20 @@ from crosscheck.ingest.motley_fool import (
     parse_participant_line,
     parse_participant_roster,
 )
-from crosscheck.models import Chunk, DocumentMeta
+from crosscheck.models import (
+    Chunk,
+    DocumentMeta,
+    fiscal_period_from_quarter,
+    make_chunk_id,
+)
 
-SectionType = Literal["prepared_remarks", "qa", "unknown"]
+SectionKind = Literal["prepared_remarks", "qa", "unknown"]
+
+SECTION_LABELS: dict[SectionKind, str] = {
+    "prepared_remarks": "Prepared Remarks",
+    "qa": "Q&A",
+    "unknown": "Unknown",
+}
 
 # Motley Fool / IR / Seeking Alpha style speaker lines.
 SPEAKER_PATTERNS: list[re.Pattern[str]] = [
@@ -41,12 +58,27 @@ SPEAKER_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^(?P<speaker>[A-Z][A-Z .'()\-]{1,40})\s*:\s*(?P<rest>.*)$"),
 ]
 
-QA_MARKERS = re.compile(
-    r"\b(question[- ]and[- ]answer|q\s*&\s*a|questions?\s+and\s+answers?)\b",
+# Strong prepared → Q&A transitions only (not incidental "question" mentions
+# or the Operator's early "there will be a Q&A session" preview).
+QA_TRANSITION = re.compile(
+    r"("
+    r"\b(?:open(?:\s+up)?(?:\s+the)?\s+call(?:\s*,?\s*operator,?)?\s+(?:to|for)\s+questions?)\b|"
+    r"\b(?:open(?:\s+up)?\s+the\s+lines?\s+for\s+(?:the\s+)?(?:question|q\s*(?:&|and)\s*a))\b|"
+    r"\b(?:move\s+over\s+to\s+q(?:\s*(?:&|and)\s*a)?)\b|"
+    r"\b(?:go\s+to\s+q(?:\s*(?:&|and)\s*a)?)\b|"
+    r"\b(?:will|we'll|we will)\s+take\s+your\s+questions?\b|"
+    r"\b(?:first\s+question\s+comes?\s+from)\b|"
+    r"\b(?:may\s+we\s+have\s+the\s+first\s+question)\b|"
+    r"^\s*questions?\s*(?:&|and)\s*answers?\s*:?\s*$"
+    r")",
     re.I,
 )
-PREPARED_MARKERS = re.compile(
-    r"\b(prepared\s+remarks|opening\s+remarks|operator\s+instructions)\b",
+PREPARED_HEADERS = re.compile(
+    r"\b(prepared\s+remarks|opening\s+remarks)\b",
+    re.I,
+)
+_IR_ROLE = re.compile(
+    r"\b(investor\s+relations|ir\b)",
     re.I,
 )
 
@@ -169,13 +201,9 @@ def _match_speaker(line: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-def _detect_section(line: str, current: SectionType) -> SectionType:
-    """Update prepared-remarks vs Q&A state from marker phrases on ``line``."""
-    if QA_MARKERS.search(line):
-        return "qa"
-    if PREPARED_MARKERS.search(line):
-        return "prepared_remarks"
-    return current
+def _is_qa_transition(line: str) -> bool:
+    """True for a clear prepared-remarks → Q&A break phrase."""
+    return bool(QA_TRANSITION.search(line))
 
 
 def _is_strong_call_turn(line: str) -> bool:
@@ -201,40 +229,56 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
     """Split a transcript into speaker-turn chunks with inherited metadata.
 
     Each chunk is one continuous speaker block; metadata includes
-    ``speaker_name``, optional ``speaker_title``, and ``section_type``.
+    ``speaker_name``, optional ``speaker_role``, and ``section``.
+
+    Section labeling is best-effort: start in prepared remarks; flip to Q&A after
+    a strong Operator / IR transition. Claim extraction does not depend on it.
     """
     roster = parse_participant_roster(text)
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     chunks: list[Chunk] = []
-    section: SectionType = "prepared_remarks"
+    section_kind: SectionKind = "prepared_remarks"
+    pending_qa = False
+    turn_section: SectionKind = "prepared_remarks"
     speaker: str | None = None
-    speaker_title: str | None = None
+    speaker_role: str | None = None
     buf: list[str] = []
     in_preamble = True
     in_glossary = False
+    fiscal_period = fiscal_period_from_quarter(meta.fiscal_quarter)
 
     def flush() -> None:
-        nonlocal buf, speaker, speaker_title
+        nonlocal buf, speaker, speaker_role, section_kind, pending_qa, turn_section
         body = "\n".join(buf).strip()
         buf = []
         if not body or speaker is None:
             return
-        title = speaker_title or lookup_speaker_title(speaker, roster)
+        role = speaker_role or lookup_speaker_title(speaker, roster)
+        idx = len(chunks)
         chunks.append(
             Chunk(
-                text=body,
-                doc_type="transcript",
-                ticker=meta.ticker,
+                chunk_id=make_chunk_id(
+                    ticker=meta.ticker,
+                    fiscal_year=meta.fiscal_year,
+                    fiscal_period=fiscal_period,
+                    doc_type="transcript",
+                    index=idx,
+                ),
+                ticker=meta.ticker.upper(),
                 company_name=meta.company_name,
+                doc_type="transcript",
                 fiscal_year=meta.fiscal_year,
-                fiscal_quarter=meta.fiscal_quarter,
-                chunk_index=len(chunks),
+                fiscal_period=fiscal_period,
+                is_table=False,
+                text=body,
+                section=SECTION_LABELS[turn_section],
                 speaker_name=speaker,
-                speaker_title=title,
-                section_type=section,
-                source_path=meta.source_path,
+                speaker_role=role,
             )
         )
+        if pending_qa:
+            section_kind = "qa"
+            pending_qa = False
 
     for raw in lines:
         line = raw.rstrip()
@@ -251,11 +295,14 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
         if CALL_START_HEADERS.match(stripped):
             in_preamble = False
             in_glossary = False
-            section = _detect_section(stripped, section)
+            if PREPARED_HEADERS.search(stripped):
+                section_kind = "prepared_remarks"
+            elif _is_qa_transition(stripped):
+                # Explicit "Questions & Answers:" header → Q&A from here on.
+                section_kind = "qa"
             continue
 
         if in_preamble:
-            # Glossary defs are never call turns; dialogue ``Name: Thanks…`` ends preamble
             if in_glossary and not _is_strong_call_turn(stripped):
                 continue
             if _is_strong_call_turn(stripped):
@@ -264,24 +311,43 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
             else:
                 continue
 
-        section = _detect_section(stripped, section)
         hit = _match_speaker(stripped)
         if hit:
             flush()
             speaker, rest, inline_title = hit
-            speaker_title = inline_title or lookup_speaker_title(speaker, roster)
+            speaker_role = inline_title or lookup_speaker_title(speaker, roster)
             if inline_title:
                 roster.setdefault(speaker.lower(), inline_title)
+            turn_section = section_kind
+            # IR / Operator lines that themselves open Q&A start as Q&A.
+            probe = " ".join(x for x in (rest, speaker, speaker_role) if x)
+            if section_kind != "qa" and _is_qa_transition(probe):
+                if speaker.lower() == "operator" or _IR_ROLE.search(speaker_role or ""):
+                    section_kind = "qa"
+                    turn_section = "qa"
+                else:
+                    pending_qa = True
             buf = [rest] if rest else []
             continue
 
         if speaker is None:
             continue
+
+        if section_kind != "qa" and _is_qa_transition(stripped):
+            # Announcement inside an executive turn: keep this turn prepared,
+            # switch on the next speaker.
+            pending_qa = True
         buf.append(stripped)
 
     flush()
     for i, c in enumerate(chunks):
-        c.chunk_index = i
+        c.chunk_id = make_chunk_id(
+            ticker=c.ticker,
+            fiscal_year=c.fiscal_year,
+            fiscal_period=c.fiscal_period,
+            doc_type=c.doc_type,
+            index=i,
+        )
     return chunks
 
 

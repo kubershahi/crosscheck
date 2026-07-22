@@ -222,6 +222,13 @@ data/raw/filings/**
 data/raw/transcripts/**
 data/chunks/**
 !data/chunks/.gitkeep
+!data/chunks/**/.gitkeep
+data/claims/**
+!data/claims/.gitkeep
+data/indices/**
+!data/indices/.gitkeep
+data/reports/**
+!data/reports/.gitkeep
 !data/raw/.gitkeep
 !data/manifests/
 !data/manifests/**
@@ -234,3 +241,7 @@ data/chunks/**
 
 # Markdown Files
 earnings-rag-blueprint.md
+
+# Misc Files
+key.txt
+day-2-summary.md

@@ -2,6 +2,9 @@
 
 Walks EDGAR HTML, splits prose on Item / MD&A-style headers, and keeps each
 ``<table>`` as a single atomic TSV chunk so row/column meaning is preserved.
+
+Emits **stateless** :class:`~crosscheck.models.Chunk` rows (local ``chunk_id``
+only — no ``global_id``).
 """
 
 from __future__ import annotations
@@ -13,7 +16,13 @@ import warnings
 
 from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
 
-from crosscheck.models import Chunk, DocumentMeta
+from crosscheck.models import (
+    Chunk,
+    DocumentMeta,
+    filing_doc_type,
+    filing_fiscal_period,
+    make_chunk_id,
+)
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -56,7 +65,6 @@ def _is_section_header(text: str) -> str | None:
     cleaned = _normalize_ws(text)
     if not cleaned or len(cleaned) > 180:
         return None
-    # Strip leading junk common in iXBRL
     cleaned = re.sub(r"^[\W\d_]{0,6}", "", cleaned)
     for pat in SECTION_PATTERNS:
         if pat.search(cleaned):
@@ -80,7 +88,6 @@ def _strip_ixbrl_noise(soup: BeautifulSoup) -> None:
     """Remove scripts/styles and ``display:none`` XBRL chrome in-place."""
     for tag in soup.find_all(["script", "style", "noscript"]):
         tag.decompose()
-    # Remove common XBRL hidden blocks
     for tag in soup.find_all(attrs={"style": re.compile(r"display\s*:\s*none", re.I)}):
         tag.decompose()
 
@@ -101,7 +108,6 @@ def _iter_blocks(soup: BeautifulSoup) -> list[tuple[str, str]]:
                 blocks.append(("table", tsv))
             return
 
-        # Descend into containers that hold nested structure / tables.
         child_tags = [c for c in node.children if isinstance(c, Tag)]
         has_table_descendant = any(
             (c.name or "").lower() == "table" or c.find("table") for c in child_tags
@@ -125,13 +131,43 @@ def _iter_blocks(soup: BeautifulSoup) -> list[tuple[str, str]]:
     if isinstance(body, Tag):
         walk(body)
 
-    # Deduplicate consecutive identical short lines (common in EDGAR HTML)
     deduped: list[tuple[str, str]] = []
     for kind, text in blocks:
         if deduped and deduped[-1] == (kind, text) and len(text) < 200:
             continue
         deduped.append((kind, text))
     return deduped
+
+
+def _make_filing_chunk(
+    *,
+    text: str,
+    section: str,
+    meta: DocumentMeta,
+    is_table: bool,
+    index: int,
+) -> Chunk:
+    doc_type = filing_doc_type(meta.form, meta.fiscal_quarter)
+    fiscal_period = filing_fiscal_period(meta.form, meta.fiscal_quarter)
+    return Chunk(
+        chunk_id=make_chunk_id(
+            ticker=meta.ticker,
+            fiscal_year=meta.fiscal_year,
+            fiscal_period=fiscal_period,
+            doc_type=doc_type,
+            index=index,
+        ),
+        ticker=meta.ticker.upper(),
+        company_name=meta.company_name,
+        doc_type=doc_type,
+        fiscal_year=meta.fiscal_year,
+        fiscal_period=fiscal_period,
+        is_table=is_table,
+        text=text,
+        section=section,
+        speaker_name=None,
+        speaker_role=None,
+    )
 
 
 def _flush_text(
@@ -146,7 +182,6 @@ def _flush_text(
     buf.clear()
     if len(text) < MIN_TEXT_CHUNK_CHARS:
         return
-    # Split oversized prose while keeping section metadata.
     while len(text) > MAX_TEXT_CHUNK_CHARS:
         cut = text.rfind("\n\n", 0, MAX_TEXT_CHUNK_CHARS)
         if cut < MAX_TEXT_CHUNK_CHARS // 2:
@@ -154,42 +189,28 @@ def _flush_text(
         piece, text = text[:cut].strip(), text[cut:].strip()
         if len(piece) >= MIN_TEXT_CHUNK_CHARS:
             chunks.append(
-                Chunk(
+                _make_filing_chunk(
                     text=piece,
-                    doc_type="filing",
-                    ticker=meta.ticker,
-                    company_name=meta.company_name,
-                    fiscal_year=meta.fiscal_year,
-                    fiscal_quarter=meta.fiscal_quarter,
-                    chunk_index=len(chunks),
-                    section_header=section,
+                    section=section,
+                    meta=meta,
                     is_table=False,
-                    source_path=meta.source_path,
+                    index=len(chunks),
                 )
             )
     if len(text) >= MIN_TEXT_CHUNK_CHARS:
         chunks.append(
-            Chunk(
+            _make_filing_chunk(
                 text=text,
-                doc_type="filing",
-                ticker=meta.ticker,
-                company_name=meta.company_name,
-                fiscal_year=meta.fiscal_year,
-                fiscal_quarter=meta.fiscal_quarter,
-                chunk_index=len(chunks),
-                section_header=section,
+                section=section,
+                meta=meta,
                 is_table=False,
-                source_path=meta.source_path,
+                index=len(chunks),
             )
         )
 
 
 def chunk_filing(html: str, meta: DocumentMeta) -> list[Chunk]:
-    """Split filing HTML into section-aware prose chunks and atomic table chunks.
-
-    Section headers become ``section_header`` metadata; each ``<table>`` is one
-    chunk with ``is_table=True``.
-    """
+    """Split filing HTML into section-aware prose chunks and atomic table chunks."""
     soup = BeautifulSoup(html, "lxml")
     _strip_ixbrl_noise(soup)
     blocks = _iter_blocks(soup)
@@ -206,31 +227,31 @@ def chunk_filing(html: str, meta: DocumentMeta) -> list[Chunk]:
                 section = header
                 continue
             prose_buf.append(text)
-            # Opportunistically flush very large buffers
             if sum(len(x) for x in prose_buf) > MAX_TEXT_CHUNK_CHARS:
                 _flush_text(prose_buf, section=section, meta=meta, chunks=chunks)
         else:
             _flush_text(prose_buf, section=section, meta=meta, chunks=chunks)
             chunks.append(
-                Chunk(
+                _make_filing_chunk(
                     text=text,
-                    doc_type="filing",
-                    ticker=meta.ticker,
-                    company_name=meta.company_name,
-                    fiscal_year=meta.fiscal_year,
-                    fiscal_quarter=meta.fiscal_quarter,
-                    chunk_index=len(chunks),
-                    section_header=section,
+                    section=section,
+                    meta=meta,
                     is_table=True,
-                    source_path=meta.source_path,
+                    index=len(chunks),
                 )
             )
 
     _flush_text(prose_buf, section=section, meta=meta, chunks=chunks)
 
-    # Re-index for stability
+    # Re-assign stable local chunk_ids after final ordering
     for i, c in enumerate(chunks):
-        c.chunk_index = i
+        c.chunk_id = make_chunk_id(
+            ticker=c.ticker,
+            fiscal_year=c.fiscal_year,
+            fiscal_period=c.fiscal_period,
+            doc_type=c.doc_type,
+            index=i,
+        )
     return chunks
 
 

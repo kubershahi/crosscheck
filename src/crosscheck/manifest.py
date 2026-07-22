@@ -23,6 +23,7 @@ class CompanyPeriod(BaseModel):
     fiscal_quarter: int = Field(ge=1, le=4)
     form: str | None = None  # null → auto: Q4→10-K, else 10-Q
     transcript_url: HttpUrl | str | None = None
+    include: bool = False  # opt-in: fetch/chunk only when true (unless --ticker overrides)
 
     @field_validator("ticker")
     @classmethod
@@ -84,9 +85,18 @@ def filter_manifest(
     manifest: Manifest,
     *,
     tickers: list[str] | None = None,
+    include_only: bool = True,
 ) -> list[CompanyPeriod]:
-    """Optionally filter manifest rows to a set of tickers."""
-    if not tickers:
-        return list(manifest.companies)
-    wanted = {t.upper() for t in tickers}
-    return [c for c in manifest.companies if c.ticker in wanted]
+    """Filter manifest rows by ticker and/or ``include`` flag.
+
+    When ``tickers`` is unset and ``include_only`` is True (default), only rows
+    with ``include: true`` are returned. An explicit ``--ticker`` list always
+    wins and ignores the include flag so you can force a one-off fetch.
+    """
+    rows = list(manifest.companies)
+    if tickers:
+        wanted = {t.upper() for t in tickers}
+        return [c for c in rows if c.ticker in wanted]
+    if include_only:
+        return [c for c in rows if c.include]
+    return rows

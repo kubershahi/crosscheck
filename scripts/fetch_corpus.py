@@ -6,8 +6,11 @@ Examples::
     # Fetch filing + transcript for AAPL (from data/manifests/companies.yml)
     python scripts/fetch_corpus.py --ticker AAPL
 
-    # All rows in the manifest
+    # All rows with include: true in the manifest
     python scripts/fetch_corpus.py
+
+    # Force a ticker even if include: false
+    python scripts/fetch_corpus.py --ticker MSFT
 
     # Only one side
     python scripts/fetch_corpus.py --ticker AAPL --filings-only
@@ -53,7 +56,15 @@ def main() -> None:
         "--ticker",
         action="append",
         dest="tickers",
-        help="Filter to ticker(s); repeatable. Default: all rows in manifest.",
+        help=(
+            "Filter to ticker(s); repeatable. Overrides include: false. "
+            "Default: rows with include: true."
+        ),
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Fetch every manifest row, ignoring the include flag.",
     )
     parser.add_argument("--filings-only", action="store_true")
     parser.add_argument("--transcripts-only", action="store_true")
@@ -62,15 +73,30 @@ def main() -> None:
 
     if args.filings_only and args.transcripts_only:
         parser.error("Use only one of --filings-only / --transcripts-only")
+    if args.all and args.tickers:
+        parser.error("Use only one of --all / --ticker")
 
     do_filings = not args.transcripts_only
     do_transcripts = not args.filings_only
 
     manifest = load_manifest(args.manifest)
-    rows = filter_manifest(manifest, tickers=args.tickers)
+    rows = filter_manifest(
+        manifest,
+        tickers=args.tickers,
+        include_only=not args.all,
+    )
     if not rows:
-        print("No matching companies in manifest.")
+        print(
+            "No matching companies in manifest. "
+            "Set include: true in companies.yml, pass --ticker, or use --all."
+        )
         sys.exit(1)
+
+    print(
+        f"Fetching {len(rows)} compan"
+        f"{'y' if len(rows) == 1 else 'ies'}: "
+        f"{', '.join(r.ticker for r in rows)}"
+    )
 
     for period in rows:
         form = period.resolved_form()
