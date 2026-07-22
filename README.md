@@ -38,10 +38,16 @@ data/
   claims/{fiscal_year}/{TICKER}/
     AAPL_FY2025_Q4_claims.json
   indices/
-    all_chunks.jsonl
-    embeddings.npy
-    unified_master.faiss
-    unified_master.manifest.json
+    filings/
+      all_chunks.jsonl
+      embeddings.npy
+      index.faiss
+      manifest.json
+    transcripts/
+      all_chunks.jsonl
+      embeddings.npy
+      index.faiss
+      manifest.json
   reports/{fiscal_year}/{TICKER}/
     AAPL_FY2025_Q4.json
 ```
@@ -176,36 +182,46 @@ Query-time claim embeddings use the raw claim text only.
 
 ### Vector store layout (FAISS + chunk metadata)
 
-There is **no separate metadata vector DB** (no Chroma/Weaviate). Day 2 uses a dual-file design:
+There is **no separate metadata vector DB** (no Chroma/Weaviate). Day 2 keeps
+**separate** filings and transcripts corpora:
 
 | On disk | Role |
 |---------|------|
-| `data/indices/all_chunks.jsonl` | Unified text + metadata with sequential `global_id` |
-| `data/indices/embeddings.npy` | Disk-backed `(N, 1024)` float32 embedding memmap |
-| `data/indices/unified_master.faiss` | Unified `IndexFlatIP`; row = `global_id` |
-| `data/indices/unified_master.manifest.json` | Model, dimensions, paths, counts |
+| `data/indices/filings/all_chunks.jsonl` | Filing text + metadata with sequential `global_id` |
+| `data/indices/filings/embeddings.npy` | Disk-backed `(N, 1024)` float32 embedding memmap |
+| `data/indices/filings/index.faiss` | Filings `IndexFlatIP` used by NLI |
+| `data/indices/filings/manifest.json` | Model, dimensions, paths, counts |
+| `data/indices/transcripts/*` | Same layout for transcript chunks (not used by NLI) |
 | `data/chunks/{year}/{TICKER}/*.jsonl` | Stateless source chunks; no `global_id` |
 
-At load time, FAISS row `i` is joined to `global_id=i` in
-`data/indices/all_chunks.jsonl`. Retrieval returns full `IndexedChunk` objects
-with metadata.
+At load time, FAISS row `i` is joined to `global_id=i` in the matching corpus
+`all_chunks.jsonl`. NLI loads the **filings** index only.
 
 ### LLM profiles (Google GenAI for both)
 
-| Profile | Env | Primary | Backup |
-|---------|-----|---------|--------|
-| **development** (default) | `CROSSCHECK_LLM_PROFILE=development` | `gemini-3-flash-preview` | `gemini-3.1-flash-lite` |
-| **production** | `CROSSCHECK_LLM_PROFILE=production` | preset via `CROSSCHECK_PRODUCTION_MODEL` | alternate Gemini |
+Development tries models in **rate-limit rank order** (highest free-tier RPM/RPD first):
+
+1. `gemini-3.1-flash-lite`
+2. `gemini-2.5-flash-lite`
+3. `gemini-3-flash-preview` → `gemini-2.5-flash` → `gemini-3.5-flash`
+
+| Profile | Env | Model selection |
+|---------|-----|-----------------|
+| **development** (default) | `CROSSCHECK_LLM_PROFILE=development` | ranked list above |
+| **production** | `CROSSCHECK_LLM_PROFILE=production` | preset first, then same rank |
 
 Set `GOOGLE_API_KEY` for both profiles.
 
-Production presets: `gemini` (`gemini-2.5-flash`), `gemini-lite`, `gemini-pro`.
+Production presets: `gemini-lite` (default), `gemini`, `gemini-pro`.
 
 ### Commands
 
 ```bash
-# 4) Merge all chunks → disk-stream embeddings → unified FAISS
+# 4) Separate filings + transcripts indices (disk-stream embeddings → FAISS)
 python scripts/build_indices.py --force --batch-size 24
+# Or one corpus only:
+# python scripts/build_indices.py --corpus filings --force
+# python scripts/build_indices.py --corpus transcripts --force
 
 # 5) Extract fixed claims (one ticker, or omit --ticker for all missing)
 python scripts/extract_claims.py --ticker AAPL --n 10

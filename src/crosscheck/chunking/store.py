@@ -4,9 +4,10 @@ Per-company outputs (stateless)::
 
     data/chunks/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_{doc_type}.jsonl
 
-Master assembly (stateful index build)::
+Corpus assembly (stateful index build)::
 
-    data/indices/all_chunks.jsonl   # includes sequential global_id
+    data/indices/filings/all_chunks.jsonl
+    data/indices/transcripts/all_chunks.jsonl
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from crosscheck.config import CHUNKS_DIR, INDICES_DIR, chunks_dir
+from crosscheck.config import CHUNKS_DIR, chunks_dir
 from crosscheck.models import Chunk, IndexedChunk
 
 
@@ -31,11 +32,6 @@ def chunk_output_path(
     safe = doc_type.replace("/", "-")
     name = f"{ticker}_FY{fiscal_year}_Q{fiscal_quarter}_{safe}.jsonl"
     return chunks_dir(ticker, fiscal_year) / name
-
-
-def all_chunks_path() -> Path:
-    """Return ``data/indices/all_chunks.jsonl``."""
-    return INDICES_DIR / "all_chunks.jsonl"
 
 
 def write_chunks_jsonl(chunks: list[Chunk], path: Path) -> Path:
@@ -60,9 +56,8 @@ def load_chunks_jsonl(path: Path) -> list[Chunk]:
     return chunks
 
 
-def load_indexed_chunks_jsonl(path: Path | None = None) -> list[IndexedChunk]:
-    """Load the master ``all_chunks.jsonl`` (requires ``global_id``)."""
-    path = path or all_chunks_path()
+def load_indexed_chunks_jsonl(path: Path) -> list[IndexedChunk]:
+    """Load a corpus master JSONL (requires ``global_id``)."""
     chunks: list[IndexedChunk] = []
     with path.open(encoding="utf-8") as fh:
         for line in fh:
@@ -74,7 +69,7 @@ def load_indexed_chunks_jsonl(path: Path | None = None) -> list[IndexedChunk]:
 
 
 def iter_company_chunk_files(root: Path | None = None) -> list[Path]:
-    """Find per-company chunk JSONL files (excludes ``all_chunks.jsonl``)."""
+    """Find per-company chunk JSONL files (excludes master ``all_chunks.jsonl``)."""
     root = root or CHUNKS_DIR
     if not root.exists():
         return []

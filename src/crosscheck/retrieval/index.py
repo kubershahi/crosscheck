@@ -1,4 +1,8 @@
-"""Disk-streamed master chunk assembly, embeddings, and FAISS indexing."""
+"""Disk-streamed corpus assembly, embeddings, and FAISS indexing.
+
+Filings (10-K / 10-Q) and transcripts are indexed separately so NLI retrieves
+only SEC filing passages when checking transcript claims.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import gc
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import faiss
 import numpy as np
@@ -14,7 +19,6 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from crosscheck.chunking.store import (
-    all_chunks_path,
     iter_company_chunk_files,
     load_indexed_chunks_jsonl,
 )
@@ -29,38 +33,68 @@ from crosscheck.retrieval.embeddings import (
 
 EMBEDDING_DIMENSION = 1024
 
+CorpusKind = Literal["filings", "transcripts"]
+
+FILING_DOC_TYPES = frozenset({"10-K", "10-Q"})
+TRANSCRIPT_DOC_TYPES = frozenset({"transcript"})
+
+CORPUS_DOC_TYPES: dict[CorpusKind, frozenset[str]] = {
+    "filings": FILING_DOC_TYPES,
+    "transcripts": TRANSCRIPT_DOC_TYPES,
+}
+
 
 @dataclass
-class MasterIndex:
-    """Unified FAISS index + aligned ``IndexedChunk`` rows (global_id == row)."""
+class CorpusIndex:
+    """FAISS index + aligned ``IndexedChunk`` rows (global_id == row)."""
 
+    corpus: CorpusKind
     index: faiss.IndexFlatIP
     chunks: list[IndexedChunk]
     embedding_model: str
 
 
-def unified_index_path() -> Path:
-    """Return ``data/indices/unified_master.faiss``."""
-    return INDICES_DIR / "unified_master.faiss"
+# Backward-compatible alias used by older call sites.
+MasterIndex = CorpusIndex
 
 
-def unified_manifest_path() -> Path:
-    """Return ``data/indices/unified_master.manifest.json``."""
-    return INDICES_DIR / "unified_master.manifest.json"
+def corpus_indices_dir(corpus: CorpusKind) -> Path:
+    """Return ``data/indices/{filings|transcripts}/``."""
+    return INDICES_DIR / corpus
 
 
-def embeddings_path() -> Path:
-    """Return the disk-backed embedding matrix path."""
-    return INDICES_DIR / "embeddings.npy"
+def corpus_chunks_path(corpus: CorpusKind) -> Path:
+    """Return corpus master JSONL path."""
+    return corpus_indices_dir(corpus) / "all_chunks.jsonl"
 
 
-def master_index_exists() -> bool:
-    """True when all master index artifacts exist."""
+def corpus_embeddings_path(corpus: CorpusKind) -> Path:
+    """Return corpus embedding memmap path."""
+    return corpus_indices_dir(corpus) / "embeddings.npy"
+
+
+def corpus_index_path(corpus: CorpusKind) -> Path:
+    """Return corpus FAISS path."""
+    return corpus_indices_dir(corpus) / "index.faiss"
+
+
+def corpus_manifest_path(corpus: CorpusKind) -> Path:
+    """Return corpus manifest JSON path."""
+    return corpus_indices_dir(corpus) / "manifest.json"
+
+
+def filings_index_path() -> Path:
+    """Return ``data/indices/filings/index.faiss``."""
+    return corpus_index_path("filings")
+
+
+def corpus_index_exists(corpus: CorpusKind) -> bool:
+    """True when all artifacts for one corpus exist."""
     return (
-        unified_index_path().exists()
-        and all_chunks_path().exists()
-        and embeddings_path().exists()
-        and unified_manifest_path().exists()
+        corpus_index_path(corpus).exists()
+        and corpus_chunks_path(corpus).exists()
+        and corpus_embeddings_path(corpus).exists()
+        and corpus_manifest_path(corpus).exists()
     )
 
 
@@ -70,16 +104,17 @@ def count_jsonl_rows(path: Path) -> int:
         return sum(1 for line in fh if line.strip())
 
 
-def merge_all_chunks(*, force: bool = False) -> Path:
-    """Step A: merge company JSONL files into ``all_chunks.jsonl`` with global_id."""
-    out = all_chunks_path()
+def merge_corpus_chunks(corpus: CorpusKind, *, force: bool = False) -> Path:
+    """Merge matching company JSONL files into a corpus ``all_chunks.jsonl``."""
+    out = corpus_chunks_path(corpus)
     if out.exists() and not force:
         return out
 
+    allowed = CORPUS_DOC_TYPES[corpus]
     company_files = iter_company_chunk_files()
     if not company_files:
         raise FileNotFoundError(
-            f"No per-company chunk JSONL under {out.parent}. "
+            f"No per-company chunk JSONL under {INDICES_DIR.parent / 'chunks'}. "
             "Run: python scripts/build_chunks.py"
         )
 
@@ -92,6 +127,8 @@ def merge_all_chunks(*, force: bool = False) -> Path:
                     if not line.strip():
                         continue
                     chunk = Chunk.model_validate_json(line)
+                    if chunk.doc_type not in allowed:
+                        continue
                     row = IndexedChunk(
                         **chunk.model_dump(),
                         global_id=global_id,
@@ -100,8 +137,14 @@ def merge_all_chunks(*, force: bool = False) -> Path:
                     fh.write("\n")
                     global_id += 1
 
+    if global_id == 0:
+        raise FileNotFoundError(
+            f"No {corpus} chunks found under data/chunks. "
+            "Run: python scripts/build_chunks.py"
+        )
+
     print(
-        f"  merged {global_id} chunks from {len(company_files)} files → {out}",
+        f"  [{corpus}] merged {global_id} chunks from {len(company_files)} files → {out}",
         flush=True,
     )
     return out
@@ -153,21 +196,16 @@ def _write_embedding_batch(
 def stream_embeddings_to_memmap(
     *,
     model: SentenceTransformer,
-    chunks_path: Path | None = None,
-    output_path: Path | None = None,
+    chunks_path: Path,
+    output_path: Path,
     batch_size: int = 16,
     max_chunks: int | None = None,
+    progress_desc: str = "Embedding",
 ) -> tuple[Path, int]:
-    """Stream master JSONL into a disk-backed float32 embedding matrix.
-
-    ``max_chunks`` is intended for bounded smoke tests; production leaves it
-    unset and processes every row.
-    """
+    """Stream corpus JSONL into a disk-backed float32 embedding matrix."""
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
 
-    chunks_path = chunks_path or all_chunks_path()
-    output_path = output_path or embeddings_path()
     total_rows = count_jsonl_rows(chunks_path)
     total_chunks = min(total_rows, max_chunks) if max_chunks else total_rows
     if total_chunks == 0:
@@ -193,7 +231,7 @@ def stream_embeddings_to_memmap(
     try:
         with chunks_path.open("r", encoding="utf-8") as fh, tqdm(
             total=total_chunks,
-            desc="Embedding",
+            desc=progress_desc,
             unit="chunk",
             dynamic_ncols=True,
         ) as pbar:
@@ -251,13 +289,11 @@ def stream_embeddings_to_memmap(
 
 def build_faiss_from_memmap(
     *,
-    source_path: Path | None = None,
-    output_path: Path | None = None,
+    source_path: Path,
+    output_path: Path,
     total_chunks: int,
 ) -> Path:
     """Load embeddings read-only and add the memmap directly to IndexFlatIP."""
-    source_path = source_path or embeddings_path()
-    output_path = output_path or unified_index_path()
     vectors = np.memmap(
         source_path,
         dtype=np.float32,
@@ -275,71 +311,118 @@ def build_faiss_from_memmap(
     return output_path
 
 
-def build_unified_index(
+def build_corpus_index(
+    corpus: CorpusKind,
     *,
     model: SentenceTransformer | None = None,
     force: bool = False,
     batch_size: int = 16,
 ) -> Path:
-    """Steps A–C: merge → contextual embed → write ``unified_master.faiss``."""
-    if master_index_exists() and not force:
-        return unified_index_path()
+    """Merge → contextual embed → write FAISS for one corpus."""
+    if corpus_index_exists(corpus) and not force:
+        return corpus_index_path(corpus)
 
-    master_chunks_path = merge_all_chunks(force=True)
+    print(f"[build_indices] assembling {corpus} index …", flush=True)
+    chunks_path = merge_corpus_chunks(corpus, force=True)
     model = model or load_embedding_model()
     disk_embeddings_path, total_chunks = stream_embeddings_to_memmap(
         model=model,
-        chunks_path=master_chunks_path,
-        output_path=embeddings_path(),
+        chunks_path=chunks_path,
+        output_path=corpus_embeddings_path(corpus),
         batch_size=batch_size,
+        progress_desc=f"Embed {corpus}",
     )
     path = build_faiss_from_memmap(
         source_path=disk_embeddings_path,
-        output_path=unified_index_path(),
+        output_path=corpus_index_path(corpus),
         total_chunks=total_chunks,
     )
 
     manifest = {
+        "corpus": corpus,
+        "doc_types": sorted(CORPUS_DOC_TYPES[corpus]),
         "embedding_model": EMBEDDING_MODEL,
         "embedding_dimension": EMBEDDING_DIMENSION,
         "embedding_dtype": "float32",
         "embedding_storage": "numpy.memmap",
         "n_chunks": total_chunks,
-        "all_chunks_path": str(all_chunks_path()),
+        "all_chunks_path": str(chunks_path),
         "embeddings_path": str(disk_embeddings_path),
         "index_path": str(path),
         "index_type": "IndexFlatIP",
         "embedding_batch_size": batch_size,
     }
-    unified_manifest_path().write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"  wrote {path} ({total_chunks} vectors)", flush=True)
+    corpus_manifest_path(corpus).write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"  [{corpus}] wrote {path} ({total_chunks} vectors)", flush=True)
     return path
 
 
-def load_master_index() -> MasterIndex:
-    """Load unified FAISS + ``all_chunks.jsonl``."""
-    if not master_index_exists():
-        raise FileNotFoundError(
-            f"Master index missing. Run: python scripts/build_indices.py\n"
-            f"  expected {unified_index_path()}"
+def build_all_indices(
+    *,
+    model: SentenceTransformer | None = None,
+    force: bool = False,
+    batch_size: int = 16,
+    corpora: list[CorpusKind] | None = None,
+) -> dict[CorpusKind, Path]:
+    """Build one or both corpus indices; share a loaded embedding model."""
+    selected: list[CorpusKind] = corpora or ["filings", "transcripts"]
+    model = model or load_embedding_model()
+    outs: dict[CorpusKind, Path] = {}
+    for corpus in selected:
+        if corpus_index_exists(corpus) and not force:
+            path = corpus_index_path(corpus)
+            print(f"skip: {corpus} index exists at {path} (use --force)", flush=True)
+            outs[corpus] = path
+            continue
+        outs[corpus] = build_corpus_index(
+            corpus,
+            model=model,
+            force=True,
+            batch_size=batch_size,
         )
-    chunks = load_indexed_chunks_jsonl()
-    index = faiss.read_index(str(unified_index_path()))
+    return outs
+
+
+def load_corpus_index(corpus: CorpusKind) -> CorpusIndex:
+    """Load FAISS + aligned master JSONL for one corpus."""
+    if not corpus_index_exists(corpus):
+        raise FileNotFoundError(
+            f"{corpus} index missing. Run: python scripts/build_indices.py "
+            f"--corpus {corpus}\n"
+            f"  expected {corpus_index_path(corpus)}"
+        )
+    chunks = load_indexed_chunks_jsonl(corpus_chunks_path(corpus))
+    index = faiss.read_index(str(corpus_index_path(corpus)))
     if index.ntotal != len(chunks):
         raise RuntimeError(
-            f"FAISS ntotal={index.ntotal} != all_chunks lines={len(chunks)}. Rebuild with --force."
+            f"FAISS ntotal={index.ntotal} != {corpus} all_chunks lines={len(chunks)}. "
+            "Rebuild with --force."
         )
-    manifest = json.loads(unified_manifest_path().read_text(encoding="utf-8"))
-    return MasterIndex(
+    manifest = json.loads(corpus_manifest_path(corpus).read_text(encoding="utf-8"))
+    return CorpusIndex(
+        corpus=corpus,
         index=index,
         chunks=chunks,
         embedding_model=manifest.get("embedding_model", EMBEDDING_MODEL),
     )
 
 
+def load_filings_index() -> CorpusIndex:
+    """Load the filings-only index used by NLI."""
+    return load_corpus_index("filings")
+
+
+def load_master_index() -> CorpusIndex:
+    """Deprecated alias for :func:`load_filings_index`."""
+    return load_filings_index()
+
+
 def retrieve(
     query: str,
-    master: MasterIndex,
+    master: CorpusIndex,
     model: SentenceTransformer,
     *,
     k: int = 5,

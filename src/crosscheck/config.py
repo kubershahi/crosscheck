@@ -6,10 +6,16 @@ Layout (year-first)::
     data/raw/transcripts/{fiscal_year}/{TICKER}/
     data/chunks/{fiscal_year}/{TICKER}/          # per-company JSONL (stateless)
     data/claims/{fiscal_year}/{TICKER}/
-    data/indices/all_chunks.jsonl                # master merge (+ global_id)
-    data/indices/embeddings.npy                  # disk-backed float32 memmap
-    data/indices/unified_master.faiss            # single FAISS IndexFlatIP
-    data/indices/unified_master.manifest.json
+    data/indices/filings/                        # 10-K / 10-Q only (NLI retrieval)
+      all_chunks.jsonl
+      embeddings.npy
+      index.faiss
+      manifest.json
+    data/indices/transcripts/                    # transcript corpus (separate)
+      all_chunks.jsonl
+      embeddings.npy
+      index.faiss
+      manifest.json
     data/reports/{fiscal_year}/{TICKER}/
 
 Company periods to fetch come from ``data/manifests/companies.yml``. Downstream
@@ -37,18 +43,24 @@ MANIFESTS_DIR = DATA_DIR / "manifests"
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
-# Both profiles use Google GenAI SDK (Gemini). Development prefers Flash, Lite backup.
-# Use currently available Gemini 3 ids (2.5 flash/lite are closed to many new API keys).
-DEVELOPMENT_LLM_PRIMARY = "gemini-3-flash-preview"
-DEVELOPMENT_LLM_BACKUP = "gemini-3.1-flash-lite"
+# Development LLM fallback order (highest free-tier RPM/RPD first).
+# Ranked from Google AI Studio rate limits: Flash Lite ≫ Flash family.
+DEVELOPMENT_LLM_RANK: list[str] = [
+    "gemini-3.1-flash-lite",  # ~15 RPM / 500 RPD
+    "gemini-2.5-flash-lite",  # ~10 RPM / 20 RPD
+    "gemini-3-flash-preview",  # Flash tier (~5 RPM / 20 RPD)
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+]
 
-# Production presets are native Gemini model ids (not OpenRouter slugs).
+# Production presets map to a preferred model; backups still follow DEVELOPMENT_LLM_RANK
+# after the chosen primary so rate-limit-friendly models remain available.
 PRODUCTION_MODEL_PRESETS: dict[str, str] = {
-    "gemini": "gemini-3-flash-preview",
     "gemini-lite": "gemini-3.1-flash-lite",
+    "gemini": "gemini-3-flash-preview",
     "gemini-pro": "gemini-2.5-pro",
 }
-DEFAULT_PRODUCTION_PRESET = "gemini"
+DEFAULT_PRODUCTION_PRESET = "gemini-lite"
 
 # Official SEC JSON map: ticker → CIK (used when a ticker is not in KNOWN_CIKS).
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -99,13 +111,23 @@ def claims_path(ticker: str, fiscal_year: int, fiscal_quarter: int) -> Path:
 
 
 def indices_dir(ticker: str, fiscal_year: int) -> Path:
-    """Deprecated per-ticker path; prefer ``unified_master.faiss``."""
+    """Deprecated per-ticker path; prefer corpus dirs under ``data/indices/``."""
     return INDICES_DIR / str(fiscal_year) / ticker.upper()
 
 
+def filings_index_path() -> Path:
+    """Return ``data/indices/filings/index.faiss``."""
+    return INDICES_DIR / "filings" / "index.faiss"
+
+
+def transcripts_index_path() -> Path:
+    """Return ``data/indices/transcripts/index.faiss``."""
+    return INDICES_DIR / "transcripts" / "index.faiss"
+
+
 def unified_master_index_path() -> Path:
-    """Return ``data/indices/unified_master.faiss``."""
-    return INDICES_DIR / "unified_master.faiss"
+    """Deprecated alias for :func:`filings_index_path`."""
+    return filings_index_path()
 
 
 def report_path(ticker: str, fiscal_year: int, fiscal_quarter: int) -> Path:
@@ -148,10 +170,15 @@ def get_google_api_key() -> str:
     )
 
 
-def resolve_llm_models() -> tuple[str, str]:
-    """Return (primary_model, backup_model) for the active LLM profile."""
+def resolve_llm_models() -> list[str]:
+    """Return ranked Gemini model ids for the active profile (try in order).
+
+    Development uses :data:`DEVELOPMENT_LLM_RANK` (rate-limit friendly first).
+    Production puts the selected preset first, then the remaining development
+    rank (and ``gemini-2.5-pro`` when the preset is ``gemini-pro``).
+    """
     if get_llm_profile() == "development":
-        return DEVELOPMENT_LLM_PRIMARY, DEVELOPMENT_LLM_BACKUP
+        return list(DEVELOPMENT_LLM_RANK)
 
     preset = get_production_preset()
     primary = PRODUCTION_MODEL_PRESETS.get(preset)
@@ -162,14 +189,23 @@ def resolve_llm_models() -> tuple[str, str]:
             f"Choose one of: {valid}"
         )
 
-    # Backup: alternate Gemini tier within the same Google GenAI backend
-    if preset == "gemini":
-        backup = PRODUCTION_MODEL_PRESETS["gemini-lite"]
-    elif preset == "gemini-lite":
-        backup = PRODUCTION_MODEL_PRESETS["gemini"]
-    else:
-        backup = PRODUCTION_MODEL_PRESETS["gemini"]
-    return primary, backup
+    ranked: list[str] = [primary]
+    for model in DEVELOPMENT_LLM_RANK:
+        if model not in ranked:
+            ranked.append(model)
+    if primary == "gemini-2.5-pro" and "gemini-2.5-pro" not in ranked:
+        ranked.append("gemini-2.5-pro")
+    return ranked
+
+
+def resolve_llm_primary_backup() -> tuple[str, str]:
+    """Convenience: first two models from :func:`resolve_llm_models`."""
+    models = resolve_llm_models()
+    if not models:
+        raise RuntimeError("No LLM models configured")
+    if len(models) == 1:
+        return models[0], models[0]
+    return models[0], models[1]
 
 
 def get_sec_user_agent() -> str:
