@@ -42,10 +42,11 @@ REPORTS_DIR = DATA_DIR / "reports"
 MANIFESTS_DIR = DATA_DIR / "manifests"
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
-# Development LLM fallback order (highest free-tier RPM/RPD first).
-# Ranked from Google AI Studio rate limits: Flash Lite ≫ Flash family.
-DEVELOPMENT_LLM_RANK: list[str] = [
+# Gemini model fallback order (highest free-tier RPM/RPD first).
+# Both development and production profiles use this same rank via resolve_llm_models().
+LLM_MODEL_RANK: list[str] = [
     "gemini-3.1-flash-lite",  # ~15 RPM / 500 RPD
     "gemini-2.5-flash-lite",  # ~10 RPM / 20 RPD
     "gemini-3-flash-preview",  # Flash tier (~5 RPM / 20 RPD)
@@ -53,14 +54,8 @@ DEVELOPMENT_LLM_RANK: list[str] = [
     "gemini-3.5-flash",
 ]
 
-# Production presets map to a preferred model; backups still follow DEVELOPMENT_LLM_RANK
-# after the chosen primary so rate-limit-friendly models remain available.
-PRODUCTION_MODEL_PRESETS: dict[str, str] = {
-    "gemini-lite": "gemini-3.1-flash-lite",
-    "gemini": "gemini-3-flash-preview",
-    "gemini-pro": "gemini-2.5-pro",
-}
-DEFAULT_PRODUCTION_PRESET = "gemini-lite"
+# Backward-compatible alias.
+DEVELOPMENT_LLM_RANK = LLM_MODEL_RANK
 
 # Official SEC JSON map: ticker → CIK (used when a ticker is not in KNOWN_CIKS).
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -143,7 +138,10 @@ def get_embedding_device_pref() -> str:
 
 
 def get_llm_profile() -> Literal["development", "production"]:
-    """Return ``development`` (default) or ``production`` Gemini tier."""
+    """Return ``development`` (default) or ``production`` (logging label only).
+
+    Both profiles use the same :data:`LLM_MODEL_RANK` via :func:`resolve_llm_models`.
+    """
     raw = os.getenv("CROSSCHECK_LLM_PROFILE", "development").strip().lower()
     # Accept legacy "test" as an alias for development.
     if raw in {"development", "test", "dev"}:
@@ -153,9 +151,9 @@ def get_llm_profile() -> Literal["development", "production"]:
     return "development"
 
 
-def get_production_preset() -> str:
-    """Return production preset key (``gemini``, ``gemini-lite``, ``gemini-pro``)."""
-    return os.getenv("CROSSCHECK_PRODUCTION_MODEL", DEFAULT_PRODUCTION_PRESET).strip().lower()
+def resolve_llm_models() -> list[str]:
+    """Return ranked Gemini model ids (same order for development and production)."""
+    return list(LLM_MODEL_RANK)
 
 
 def get_google_api_key() -> str:
@@ -168,34 +166,6 @@ def get_google_api_key() -> str:
         "Set GOOGLE_API_KEY in .env (https://aistudio.google.com/apikey). "
         "Required for claim extraction and NLI classification (Google GenAI)."
     )
-
-
-def resolve_llm_models() -> list[str]:
-    """Return ranked Gemini model ids for the active profile (try in order).
-
-    Development uses :data:`DEVELOPMENT_LLM_RANK` (rate-limit friendly first).
-    Production puts the selected preset first, then the remaining development
-    rank (and ``gemini-2.5-pro`` when the preset is ``gemini-pro``).
-    """
-    if get_llm_profile() == "development":
-        return list(DEVELOPMENT_LLM_RANK)
-
-    preset = get_production_preset()
-    primary = PRODUCTION_MODEL_PRESETS.get(preset)
-    if primary is None:
-        valid = ", ".join(sorted(PRODUCTION_MODEL_PRESETS))
-        raise RuntimeError(
-            f"Unknown CROSSCHECK_PRODUCTION_MODEL={preset!r}. "
-            f"Choose one of: {valid}"
-        )
-
-    ranked: list[str] = [primary]
-    for model in DEVELOPMENT_LLM_RANK:
-        if model not in ranked:
-            ranked.append(model)
-    if primary == "gemini-2.5-pro" and "gemini-2.5-pro" not in ranked:
-        ranked.append("gemini-2.5-pro")
-    return ranked
 
 
 def resolve_llm_primary_backup() -> tuple[str, str]:

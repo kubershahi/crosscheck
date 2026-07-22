@@ -8,6 +8,7 @@ from crosscheck.analysis.claims import load_saved_claims
 from crosscheck.analysis.nli import classify_claim
 from crosscheck.config import (
     EMBEDDING_MODEL,
+    RERANKER_MODEL,
     claims_path,
     get_llm_profile,
     resolve_llm_models,
@@ -15,6 +16,7 @@ from crosscheck.config import (
 from crosscheck.models import DocumentMeta, PipelineReport
 from crosscheck.retrieval.embeddings import load_embedding_model, resolve_device
 from crosscheck.retrieval.index import filings_index_path, load_filings_index, retrieve
+from crosscheck.retrieval.rerank import load_reranker, rerank_claim_passages
 
 
 def _step(n: int, total: int, msg: str) -> None:
@@ -26,14 +28,27 @@ def run_pipeline(
     period: DocumentMeta,
     *,
     top_k: int = 5,
+    use_reranker: bool = True,
+    rerank_pool_k: int | None = None,
 ) -> PipelineReport:
     """Load fixed claims, then run dense retrieval and NLI for one period."""
-    total_steps = 4
+    total_steps = 5 if use_reranker else 4
     label = f"{period.ticker} FY{period.fiscal_year} Q{period.fiscal_quarter}"
+    pool_k = rerank_pool_k if rerank_pool_k is not None else max(top_k * 10, 20)
+    if pool_k < top_k:
+        raise ValueError("rerank_pool_k must be greater than or equal to top_k")
 
     models = resolve_llm_models()
     print(f"  profile={get_llm_profile()}  llm_rank={', '.join(models)}", flush=True)
-    print(f"  embedding={EMBEDDING_MODEL}  device={resolve_device()}  top_k={top_k}", flush=True)
+    print(
+        f"  embedding={EMBEDDING_MODEL}  device={resolve_device()}  top_k={top_k}",
+        flush=True,
+    )
+    if use_reranker:
+        print(
+            f"  reranker={RERANKER_MODEL}  rerank_pool_k={pool_k}",
+            flush=True,
+        )
 
     _step(1, total_steps, f"Load filings index from {filings_index_path()}")
     filings = load_filings_index()
@@ -42,12 +57,19 @@ def run_pipeline(
     _step(2, total_steps, "Load embedding model")
     model = load_embedding_model()
 
+    reranker = None
+    if use_reranker:
+        _step(3, total_steps, "Load cross-encoder reranker")
+        reranker = load_reranker()
+
     saved_path = claims_path(
         period.ticker,
         period.fiscal_year,
         period.fiscal_quarter,
     )
-    _step(3, total_steps, f"Load fixed claims from {saved_path}")
+    claims_step = 4 if use_reranker else 3
+    classify_step = 5 if use_reranker else 4
+    _step(claims_step, total_steps, f"Load fixed claims from {saved_path}")
     saved_claims = load_saved_claims(period)
     print(
         f"    loaded {len(saved_claims.claims)} claims "
@@ -55,22 +77,44 @@ def run_pipeline(
         flush=True,
     )
 
-    _step(4, total_steps, f"Dense retrieve + NLI classify ({len(saved_claims.claims)} claims)")
+    _step(
+        classify_step,
+        total_steps,
+        f"Dense retrieve{' + rerank' if use_reranker else ''} + NLI classify "
+        f"({len(saved_claims.claims)} claims)",
+    )
     findings = []
     models_used: set[str] = set()
 
     for i, claim in enumerate(saved_claims.claims, start=1):
         preview = claim.claim[:72] + ("…" if len(claim.claim) > 72 else "")
-        print(f"    [{i}/{len(saved_claims.claims)}] retrieve k={top_k}: {preview}", flush=True)
+        dense_k = pool_k if use_reranker else top_k
+        print(
+            f"    [{i}/{len(saved_claims.claims)}] dense retrieve k={dense_k}: {preview}",
+            flush=True,
+        )
 
-        retrieved = retrieve(
+        dense_retrieved = retrieve(
             claim.claim,
             filings,
             model,
-            k=top_k,
+            k=dense_k,
             ticker=period.ticker,
             fiscal_year=period.fiscal_year,
         )
+        retrieved = dense_retrieved
+        if use_reranker and reranker is not None:
+            retrieved = rerank_claim_passages(
+                claim.claim,
+                dense_retrieved,
+                top_k=top_k,
+                model=reranker,
+            )
+            print(
+                f"    [{i}/{len(saved_claims.claims)}] reranked "
+                f"{len(dense_retrieved)} → {len(retrieved)} passages",
+                flush=True,
+            )
         print(
             f"    [{i}/{len(saved_claims.claims)}] retrieved {len(retrieved)} passages → NLI …",
             flush=True,

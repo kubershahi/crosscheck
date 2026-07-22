@@ -4,7 +4,8 @@
 Examples::
 
     python scripts/run_pipeline.py --ticker AAPL
-    python scripts/run_pipeline.py --ticker AAPL --top-k 5
+    python scripts/run_pipeline.py --ticker AAPL --top-k 5 --rerank-pool-k 60
+    python scripts/run_pipeline.py --ticker AAPL --top-k 5 --no-rerank
 
 Output: JSON to terminal and ``data/reports/{year}/{TICKER}/`` file.
 
@@ -26,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.analysis.pipeline import run_pipeline  # noqa: E402
-from crosscheck.config import CLAIMS_DIR, get_llm_profile, report_path, resolve_llm_models  # noqa: E402
+from crosscheck.config import CLAIMS_DIR, report_path  # noqa: E402
 from crosscheck.models import DocumentMeta, SavedTranscriptClaims  # noqa: E402
 
 
@@ -46,6 +47,19 @@ def main() -> None:
         type=int,
         default=5,
         help="Number of filing passages to retrieve per claim (default: 5).",
+    )
+    parser.add_argument(
+        "--rerank-pool-k",
+        type=int,
+        help=(
+            "Dense candidate pool size before cross-encoder reranking "
+            "(default: max(top_k*10, 20))."
+        ),
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable cross-encoder reranking and use dense retrieval only.",
     )
     parser.add_argument(
         "--profile",
@@ -75,31 +89,30 @@ def main() -> None:
             fiscal_quarter=saved.fiscal_quarter,
         )
         label = f"{period.ticker} FY{period.fiscal_year} Q{period.fiscal_quarter}"
-        models = resolve_llm_models()
         out = report_path(period.ticker, period.fiscal_year, period.fiscal_quarter)
 
         print(f"=== Crosscheck pipeline: {label} ===")
         print(f"  claims source: {claim_file}")
-        print(f"  llm profile: {get_llm_profile()}  models={', '.join(models)}")
-        print(f"  retrieve top_k: {args.top_k}")
         print(f"  report path: {out}")
         print()
 
         try:
-            report = run_pipeline(period, top_k=args.top_k)
+            report = run_pipeline(
+                period,
+                top_k=args.top_k,
+                use_reranker=not args.no_rerank,
+                rerank_pool_k=args.rerank_pool_k,
+            )
         except FileNotFoundError as exc:
             print(exc)
             sys.exit(1)
 
-        print()
-        print("=== Report JSON ===")
         payload = report.model_dump(mode="json")
         text = json.dumps(payload, indent=2)
-        print(text)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text + "\n", encoding="utf-8")
-        print(f"\n=== Wrote {out} ===")
+        print(f"=== Wrote {out} ===")
 
 
 if __name__ == "__main__":

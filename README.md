@@ -4,6 +4,9 @@ Cross-document RAG that checks earnings-call claims against the same
 company-quarter’s 10-Q/10-K filing, and returns structured findings:
 **Consistent**, **Contradictory**, or **Unverifiable**.
 
+> **Note:** Day 2 was built on FY2025 Q4 transcripts vs 10-K — a scope mismatch.
+> Day 3 switches eval to Q1–Q3 (transcript ↔ 10-Q) before tackling Q4/10-K.
+
 Design notes: [`earnings-rag-blueprint.md`](earnings-rag-blueprint.md).
 
 ---
@@ -33,7 +36,7 @@ data/
       FY2025_Q4.txt            # cleaned transcript
       FY2025_Q4.meta.json      # url, call_date, call_participants, …
   chunks/{fiscal_year}/{TICKER}/
-    AAPL_FY2025_Q4_filing.jsonl
+    AAPL_FY2025_Q4_10-K.jsonl
     AAPL_FY2025_Q4_transcript.jsonl
   claims/{fiscal_year}/{TICKER}/
     AAPL_FY2025_Q4_claims.json
@@ -69,8 +72,7 @@ cp .env.example .env
 Day 2 optional env (see `.env.example`):
 
 ```bash
-CROSSCHECK_LLM_PROFILE=development   # development | production
-CROSSCHECK_PRODUCTION_MODEL=gemini   # gemini | gemini-lite | gemini-pro
+CROSSCHECK_LLM_PROFILE=development   # development | production (same model rank)
 CROSSCHECK_EMBEDDING_DEVICE=mps      # mps | cpu | cuda
 ```
 
@@ -166,93 +168,117 @@ Every chunk carries `ticker` + `company_name` (colloquial) so later retrieval ca
 
 ---
 
-## Step 2 — Embed, retrieve, and NLI (done)
+## Step 2 — Embed, retrieve, rerank, and NLI (done)
 
-Day 2 embeds chunk JSONL with **BGE-M3** (`BAAI/bge-m3`) on local **MPS** (Apple Silicon), builds dual FAISS indices (vectors) joined to Day 1 chunk JSONL (metadata + text), persists fixed executive claims via Google GenAI, dense-retrieves filing passages, and classifies each claim.
+Day 2 turns Day 1 chunks into searchable indices, extracts fixed transcript claims,
+retrieves filing evidence per claim, and classifies each claim as **Consistent**,
+**Contradictory**, or **Unverifiable**. Full design notes:
+[`earnings-rag-blueprint.md`](earnings-rag-blueprint.md) (Day 2 section).
 
-### Embeddings and context injection
+### Key decisions
 
-Chunks are embedded with bracketed structural headers before encoding:
+| Decision | Choice |
+|----------|--------|
+| Manifest scope | Fetch only; chunking+ downstream discover files in `data/raw`, `data/chunks`, `data/claims` |
+| Chunk vs index state | Stateless per-company JSONL → merged corpus rows with `global_id` aligned to FAISS row `i` |
+| Vector corpora | **Separate** filings and transcripts indices; NLI searches **filings only** |
+| Embeddings | `BAAI/bge-m3` (1024-d), contextual headers at index time; raw claim text at query time |
+| Claim source | C-suite speaker turns (CEO/CFO/etc.) stitched in call order — not section labels |
+| Claim persistence | One JSON per company-quarter; skipped on re-run unless `--force` |
+| Retrieval | Dense FAISS → filter `ticker` + `fiscal_year` → cross-encoder rerank → top-k |
+| Reranker | `BAAI/bge-reranker-v2-m3` (pairs with BGE-M3 bi-encoder) |
+| LLM | Google GenAI + `instructor`; ranked Gemini fallback by free-tier RPM/RPD |
+| NLI cost | **One LLM request per claim** (3 claims → 3 NLI calls) |
 
-- **Narrative filing:** `[COMPANY: Apple | TYPE: 10-K | SECTION: Item 7 - MD&A]` + text
-- **Table filing:** `[COMPANY: Apple | TYPE: 10-K | SECTION: … | TABLE: …]` + `Row: col1 | col2 | …` lines
-- **Transcript:** adds `| SPEAKER: Name, Title`
+### Pipeline at a glance
 
-Query-time claim embeddings use the raw claim text only.
-
-### Vector store layout (FAISS + chunk metadata)
-
-There is **no separate metadata vector DB** (no Chroma/Weaviate). Day 2 keeps
-**separate** filings and transcripts corpora:
-
-| On disk | Role |
-|---------|------|
-| `data/indices/filings/all_chunks.jsonl` | Filing text + metadata with sequential `global_id` |
-| `data/indices/filings/embeddings.npy` | Disk-backed `(N, 1024)` float32 embedding memmap |
-| `data/indices/filings/index.faiss` | Filings `IndexFlatIP` used by NLI |
-| `data/indices/filings/manifest.json` | Model, dimensions, paths, counts |
-| `data/indices/transcripts/*` | Same layout for transcript chunks (not used by NLI) |
-| `data/chunks/{year}/{TICKER}/*.jsonl` | Stateless source chunks; no `global_id` |
-
-At load time, FAISS row `i` is joined to `global_id=i` in the matching corpus
-`all_chunks.jsonl`. NLI loads the **filings** index only.
-
-### LLM profiles (Google GenAI for both)
-
-Development tries models in **rate-limit rank order** (highest free-tier RPM/RPD first):
-
-1. `gemini-3.1-flash-lite`
-2. `gemini-2.5-flash-lite`
-3. `gemini-3-flash-preview` → `gemini-2.5-flash` → `gemini-3.5-flash`
-
-| Profile | Env | Model selection |
-|---------|-----|-----------------|
-| **development** (default) | `CROSSCHECK_LLM_PROFILE=development` | ranked list above |
-| **production** | `CROSSCHECK_LLM_PROFILE=production` | preset first, then same rank |
-
-Set `GOOGLE_API_KEY` for both profiles.
-
-Production presets: `gemini-lite` (default), `gemini`, `gemini-pro`.
+```text
+chunks → build_indices (filings + transcripts)
+claims ← extract_claims (1 LLM call per transcript period)
+report ← run_pipeline:  claim → FAISS → rerank → NLI (1 LLM call per claim)
+```
 
 ### Commands
 
 ```bash
-# 4) Separate filings + transcripts indices (disk-stream embeddings → FAISS)
+# 4) Corpus indices (disk-stream embeddings → FAISS)
 python scripts/build_indices.py --force --batch-size 24
-# Or one corpus only:
-# python scripts/build_indices.py --corpus filings --force
-# python scripts/build_indices.py --corpus transcripts --force
+# python scripts/build_indices.py --corpus filings --force   # NLI minimum
 
-# 5) Extract fixed claims (one ticker, or omit --ticker for all missing)
-python scripts/extract_claims.py --ticker AAPL --n 10
-python scripts/extract_claims.py --n 10
+# 5) Fixed claims (optional --ticker; skip existing unless --force)
+python scripts/extract_claims.py --ticker AAPL --n 3
+python scripts/extract_claims.py --n 3
 
-# 6) Load saved claims + retrieval + NLI → JSON report
+# 6) Retrieve + rerank + NLI → report JSON
 python scripts/run_pipeline.py --ticker AAPL
-python scripts/run_pipeline.py --ticker AAPL --profile production --top-k 5
+python scripts/run_pipeline.py --ticker AAPL --top-k 5 --rerank-pool-k 50
+python scripts/run_pipeline.py --ticker AAPL --no-rerank   # dense-only ablation
 ```
 
-Output: terminal JSON + `data/reports/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}.json`.
+Reports: `data/reports/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}.json`  
+Claims: `data/claims/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_claims.json`
 
-Claims are stored at `data/claims/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_claims.json`. Existing files are skipped unless `extract_claims.py --force` is used, giving RAG runs a fixed, repeatable debugging input.
+Set `GOOGLE_API_KEY`. LLM profile: `CROSSCHECK_LLM_PROFILE=development|production`.
 
-**Note on free models:** `tencent/hy3:free` works for structured calls but 10× NLI can be slow. Use `--profile production` for reliable runs.
+### Contextual injection (index time only)
+
+Chunk JSONL stores **raw text**. Headers are prepended in memory before BGE-M3 encoding only (`chunk_embedding_text` in `embeddings.py`). Query-time claims use raw claim text with no header.
+
+| Corpus | Injected header (then `\n` + raw `chunk.text`) |
+|--------|--------------------------------------------------|
+| Filing (prose/table) | `[COMPANY: {ticker} \| PERIOD: {FY\|Qn}{year} \| TYPE: 10-K\|10-Q \| SECTION: {section} \| TABLE: {true\|false}]` |
+| Transcript | `[COMPANY: {ticker} \| PERIOD: {Qn}{year} \| TYPE: transcript \| SPEAKER: {name} ({role})]` |
+
+Reranker input uses a lighter header (`rerank.py`): `[TYPE: … \| PERIOD: … \| SECTION: … \| TABLE: …]` + raw text. Table chunks today are **TSV** (tab-separated rows from HTML); Day 3 may switch to markdown or key-value if retrieval stays weak.
+
+### LLM configuration (Google GenAI + instructor)
+
+Env: `GOOGLE_API_KEY`, `CROSSCHECK_LLM_PROFILE` (optional label; **both profiles use the same model rank**).
+
+**Development and production** — identical try order (highest free-tier RPM/RPD first):
+
+1. `gemini-3.1-flash-lite` (~15 RPM / 500 RPD)
+2. `gemini-2.5-flash-lite` (~10 RPM / 20 RPD)
+3. `gemini-3-flash-preview`
+4. `gemini-2.5-flash`
+5. `gemini-3.5-flash`
+
+Per model, `instructor` tries modes in order: `GENAI_STRUCTURED_OUTPUTS` → `GENAI_JSON` → `GENAI_TOOLS`. On 404/unavailable, skip to next model; on rate limit, retry once then fall back.
+
+**API cost:** claim extraction = 1 call per transcript period; NLI = **1 call per claim**.
 
 ### Library map (Day 2)
 
 | Path | Role |
 |------|------|
 | `src/crosscheck/retrieval/embeddings.py` | BGE-M3, bracketed context, MPS device |
-| `src/crosscheck/retrieval/index.py` | FAISS build/load, `retrieve(k=5)` |
+| `src/crosscheck/retrieval/index.py` | Corpus merge, FAISS build/load, `retrieve()` |
+| `src/crosscheck/retrieval/rerank.py` | BGE cross-encoder reranking |
 | `src/crosscheck/analysis/llm.py` | Google GenAI + instructor, model fallback |
-| `src/crosscheck/analysis/executives.py` | CEO/CFO prepared-remarks filter |
-| `src/crosscheck/analysis/claims.py` | LLM claim extraction + saved-claims storage |
-| `src/crosscheck/analysis/nli.py` | LLM NLI classification |
-| `src/crosscheck/analysis/pipeline.py` | End-to-end orchestrator |
-| `src/crosscheck/models.py` | `FinancialClaim`, `ContradictionFinding`, `PipelineReport` |
-| `scripts/build_indices.py` | Index CLI |
-| `scripts/extract_claims.py` | Extract fixed claim sets for one/all missing companies |
+| `src/crosscheck/analysis/executives.py` | C-suite speaker filter + text stitching |
+| `src/crosscheck/analysis/claims.py` | Claim extraction + saved-claims I/O |
+| `src/crosscheck/analysis/nli.py` | NLI classification |
+| `src/crosscheck/analysis/pipeline.py` | Retrieve → rerank → NLI orchestrator |
+| `scripts/build_indices.py` | Index CLI (`--corpus filings\|transcripts\|both`) |
+| `scripts/extract_claims.py` | Claim extraction CLI |
 | `scripts/run_pipeline.py` | Pipeline CLI |
+
+---
+
+## Step 3 — Retrieval quality + scale (planned)
+
+Day 2 proved the loop on FY2025 Q4, but **Q4 transcript vs 10-K is a hard pairing** — the annual filing covers the full year while the call discusses one quarter; retrieval and NLI quality suffer. Day 3 prioritizes easier pairs first, then scales infra.
+
+| Priority | Work |
+|----------|------|
+| 1 | **Switch eval corpus to Q1–Q3** — transcript ↔ matching **10-Q** (same quarter scope); re-fetch, chunk, claims, pipeline |
+| 2 | **Hybrid retrieval** — BM25 + dense FAISS, merged with reciprocal rank fusion (Non-GAAP / exact-term gap) |
+| 3 | **Table chunk formats** — if hybrid still weak, re-embed tables as markdown or key-value pairs instead of TSV |
+| 4 | **Qdrant** — once retrieval is good on Q1–Q3, migrate from local FAISS to managed Qdrant (metadata filter, incremental updates) |
+| 5 | **Q4 vs 10-K** — after Q1–Q3 works: temporal tagging (`historical` / `current_period` / `forward_guidance`), horizon-biased retrieval, prompt engineering |
+| + | Eval harness (Context Recall@K vs label precision), Streamlit demo |
+
+Full Day 3 spec: [`earnings-rag-blueprint.md`](earnings-rag-blueprint.md) (Day 3 section).
 
 ---
 
@@ -261,5 +287,5 @@ Claims are stored at `data/claims/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_claims.
 | Step | Status |
 |------|--------|
 | **1 — Fetch + chunk** | **Done** — manifest dual ingest, year-first storage, section/speaker chunking, JSONL |
-| **2 — Embed + retrieve + NLI** | **Done** — BGE-M3/MPS, dual FAISS + chunk JSONL metadata, Google GenAI, structured JSON reports |
-| **3 — Hybrid + Streamlit** | Planned — BM25+RRF, demo UI |
+| **2 — Embed + retrieve + rerank + NLI** | **Done** — BGE-M3/MPS, dual FAISS corpora, fixed claims, BGE reranker, Gemini NLI, JSON reports |
+| **3 — Q1–Q3 corpus + hybrid + Qdrant + Q4/10-K** | Planned — see Step 3 table above |
