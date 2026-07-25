@@ -14,22 +14,47 @@ from crosscheck.models import Chunk
 
 
 def chunk_embedding_text(chunk: Chunk) -> str:
-    """Build the contextual embedding string for BGE-M3."""
-    period = f"{chunk.fiscal_period}{chunk.fiscal_year}"
+    """Build the contextual embedding string for BGE-M3.
+
+    Headers are prepended only at encode time (JSONL stores raw ``text``).
+    Optional metadata is included only when present on the chunk.
+    """
+    company = chunk.company_name or chunk.ticker
+    period = chunk.quarter_period_label or f"{chunk.fiscal_period} {chunk.fiscal_year}"
+
     if chunk.doc_type == "transcript":
-        # Speaker/role matter for retrieval context; prepared vs Q&A section does not.
+        # Speaker/role + call date; prepared vs Q&A section is not injected.
         speaker = chunk.speaker_name or "Unknown"
         role = chunk.speaker_role or "Unknown"
-        header = (
-            f"[COMPANY: {chunk.ticker} | PERIOD: {period} | TYPE: {chunk.doc_type} | "
-            f"SPEAKER: {speaker} ({role})]"
-        )
+        parts = [
+            f"COMPANY: {chunk.ticker}",
+            f"NAME: {company}",
+            f"PERIOD: {period}",
+            f"TYPE: {chunk.doc_type}",
+            f"SPEAKER: {speaker} ({role})",
+        ]
+        if chunk.call_date:
+            parts.append(f"CALL_DATE: {chunk.call_date}")
     else:
         section = chunk.section or "Unknown"
-        header = (
-            f"[COMPANY: {chunk.ticker} | PERIOD: {period} | TYPE: {chunk.doc_type} | "
-            f"SECTION: {section} | TABLE: {chunk.is_table}]"
-        )
+        parts = [
+            f"COMPANY: {chunk.ticker}",
+            f"NAME: {company}",
+            f"PERIOD: {period}",
+            f"TYPE: {chunk.doc_type}",
+            f"SECTION: {section}",
+            f"TABLE: {chunk.is_table}",
+        ]
+        # subsection / subsubsection live in chunk.text (prose prepend + table
+        # preface) — do not re-inject here.
+        if chunk.filing_date:
+            parts.append(f"FILING_DATE: {chunk.filing_date}")
+        if chunk.report_date:
+            parts.append(f"REPORT_DATE: {chunk.report_date}")
+        if chunk.quarter_months:
+            parts.append(f"QUARTER_MONTHS: {','.join(chunk.quarter_months)}")
+
+    header = "[" + " | ".join(parts) + "]"
     return f"{header}\n{chunk.text.strip()}"
 
 

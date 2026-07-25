@@ -82,7 +82,7 @@ def main() -> None:
     for i, period in enumerate(periods):
         if i:
             print()
-        label = f"{period.ticker} FY{period.fiscal_year} Q{period.fiscal_quarter}"
+        label = f"{period.ticker} FY{period.fiscal_year} {period.fiscal_quarter}"
         print(f"[{label}] chunking …")
         try:
             result = build_chunks_for_period(period, write=True)

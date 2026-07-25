@@ -47,10 +47,9 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 # Gemini model fallback order (highest free-tier RPM/RPD first).
 # Both development and production profiles use this same rank via resolve_llm_models().
 LLM_MODEL_RANK: list[str] = [
-    "gemini-3.1-flash-lite",  # ~15 RPM / 500 RPD
-    "gemini-2.5-flash-lite",  # ~10 RPM / 20 RPD
-    "gemini-3-flash-preview",  # Flash tier (~5 RPM / 20 RPD)
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
     "gemini-3.5-flash",
 ]
 
@@ -98,10 +97,13 @@ def chunks_dir(ticker: str, fiscal_year: int) -> Path:
     return CHUNKS_DIR / str(fiscal_year) / ticker.upper()
 
 
-def claims_path(ticker: str, fiscal_year: int, fiscal_quarter: int) -> Path:
+def claims_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Path:
     """Return the persisted claims JSON path for one company-period."""
+    from crosscheck.models import as_fiscal_quarter
+
     ticker = ticker.upper()
-    name = f"{ticker}_FY{fiscal_year}_Q{fiscal_quarter}_claims.json"
+    q = as_fiscal_quarter(fiscal_quarter)
+    name = f"{ticker}_FY{fiscal_year}_{q}_claims.json"
     return CLAIMS_DIR / str(fiscal_year) / ticker / name
 
 
@@ -125,10 +127,13 @@ def unified_master_index_path() -> Path:
     return filings_index_path()
 
 
-def report_path(ticker: str, fiscal_year: int, fiscal_quarter: int) -> Path:
-    """Return ``data/reports/{year}/{TICKER}/{TICKER}_FY{y}_Q{n}.json``."""
+def report_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Path:
+    """Return ``data/reports/{year}/{TICKER}/{TICKER}_FY{y}_Q{n}_reports.json``."""
+    from crosscheck.models import as_fiscal_quarter
+
     ticker = ticker.upper()
-    name = f"{ticker}_FY{fiscal_year}_Q{fiscal_quarter}.json"
+    q = as_fiscal_quarter(fiscal_quarter)
+    name = f"{ticker}_FY{fiscal_year}_{q}_reports.json"
     return REPORTS_DIR / str(fiscal_year) / ticker / name
 
 

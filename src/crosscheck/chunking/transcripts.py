@@ -1,27 +1,28 @@
 """Speaker-turn chunking for earnings-call transcript plain text.
 
-Splits cleaned Motley Fool / IR transcripts on speaker headers
-(``Name -- Title``, ``Name:``, ``Operator:``, …).
+Splits cleaned Motley Fool / ROIC / IR transcripts on speaker headers:
+
+- Motley Fool: ``Name -- Title``, ``Name:``, ``Operator:``
+- ROIC.ai: bare name alone on a line (``Sundar Pichai``); role left null
+  unless known from a Call participants roster
 
 Preamble blocks (Date, Call participants, Industry glossary) stay in the
-``.txt`` for humans / meta but are **not** turned into chunks:
+``.txt`` for humans / meta but are **not** turned into chunks.
 
-- Date / call time belong in sidecar metadata
-- Call participants are parsed into the roster so later turns get ``speaker_role``
-- Industry glossary is Motley Fool editorial noise for retrieval / claims
-
-``section`` (Prepared Remarks vs Q&A) is best-effort metadata only. Downstream
-claim extraction and retrieval key off ``speaker_role`` and document order, not
-section labels — so imperfect transitions on new transcripts are low risk.
+Transcript chunks do **not** set ``section`` (Prepared Remarks vs Q&A is
+unreliable across hosts). Claim extraction reads the full cleaned ``.txt``
+(not chunk/speaker filters). Embeddings key off ``speaker_name`` /
+``speaker_role`` when present. Filing chunks still use ``section`` for
+Item / MD&A labels.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
 
-from crosscheck.ingest.motley_fool import (
+from crosscheck.ingest.transcript import (
+    SPEAKER_BARE_NAME,
     TITLE_CUES,
     lookup_speaker_title,
     parse_participant_line,
@@ -33,14 +34,6 @@ from crosscheck.models import (
     fiscal_period_from_quarter,
     make_chunk_id,
 )
-
-SectionKind = Literal["prepared_remarks", "qa", "unknown"]
-
-SECTION_LABELS: dict[SectionKind, str] = {
-    "prepared_remarks": "Prepared Remarks",
-    "qa": "Q&A",
-    "unknown": "Unknown",
-}
 
 # Motley Fool / IR / Seeking Alpha style speaker lines.
 SPEAKER_PATTERNS: list[re.Pattern[str]] = [
@@ -57,30 +50,6 @@ SPEAKER_PATTERNS: list[re.Pattern[str]] = [
     # ALL CAPS "TIM COOK:"
     re.compile(r"^(?P<speaker>[A-Z][A-Z .'()\-]{1,40})\s*:\s*(?P<rest>.*)$"),
 ]
-
-# Strong prepared → Q&A transitions only (not incidental "question" mentions
-# or the Operator's early "there will be a Q&A session" preview).
-QA_TRANSITION = re.compile(
-    r"("
-    r"\b(?:open(?:\s+up)?(?:\s+the)?\s+call(?:\s*,?\s*operator,?)?\s+(?:to|for)\s+questions?)\b|"
-    r"\b(?:open(?:\s+up)?\s+the\s+lines?\s+for\s+(?:the\s+)?(?:question|q\s*(?:&|and)\s*a))\b|"
-    r"\b(?:move\s+over\s+to\s+q(?:\s*(?:&|and)\s*a)?)\b|"
-    r"\b(?:go\s+to\s+q(?:\s*(?:&|and)\s*a)?)\b|"
-    r"\b(?:will|we'll|we will)\s+take\s+your\s+questions?\b|"
-    r"\b(?:first\s+question\s+comes?\s+from)\b|"
-    r"\b(?:may\s+we\s+have\s+the\s+first\s+question)\b|"
-    r"^\s*questions?\s*(?:&|and)\s*answers?\s*:?\s*$"
-    r")",
-    re.I,
-)
-PREPARED_HEADERS = re.compile(
-    r"\b(prepared\s+remarks|opening\s+remarks)\b",
-    re.I,
-)
-_IR_ROLE = re.compile(
-    r"\b(investor\s+relations|ir\b)",
-    re.I,
-)
 
 PREAMBLE_HEADERS = re.compile(
     r"^(date|call\s+participants|industry\s+glossary)\s*:?\s*$",
@@ -103,6 +72,32 @@ SKIP_SPEAKERS = {
     "industry glossary",
 }
 
+# Words that can look Title Case but are dialogue, not speaker names
+_BARE_NAME_BLOCKLIST = {
+    "yeah",
+    "yes",
+    "yep",
+    "no",
+    "sure",
+    "well",
+    "okay",
+    "ok",
+    "look",
+    "great",
+    "thanks",
+    "thank",
+    "right",
+    "alright",
+    "hello",
+    "hi",
+    "good",
+    "and",
+    "so",
+    "now",
+    "next",
+    "first",
+}
+
 # Single-token "names" that are almost always glossary / product labels
 _NON_PERSON_TOKENS = re.compile(
     r"^(optimus|cybercab|powerwall|bedrock|copilot|agent|fabric|gemini|"
@@ -110,6 +105,24 @@ _NON_PERSON_TOKENS = re.compile(
     r"upgraders|installed|metaverified|metai)$",
     re.I,
 )
+
+
+def _is_bare_speaker_name(line: str) -> bool:
+    """True for ROIC-style speaker headers: a person name alone on a line."""
+    s = line.strip()
+    if not s or s.lower() in SKIP_SPEAKERS:
+        return False
+    # Dialogue / sentence fragments, not names
+    if s[-1] in ".!?,:;":
+        return False
+    if s.lower() != "operator" and not SPEAKER_BARE_NAME.match(s):
+        return False
+    if not _looks_like_person_name(s):
+        return False
+    tokens = re.sub(r"[^A-Za-z\s]", " ", s).lower().split()
+    if any(t in _BARE_NAME_BLOCKLIST for t in tokens):
+        return False
+    return True
 
 
 def _normalize_speaker(name: str) -> str:
@@ -159,7 +172,11 @@ _DIALOGUE_STARTERS = re.compile(
 
 
 def _match_speaker(line: str) -> tuple[str, str, str | None] | None:
-    """If ``line`` is a speaker header, return ``(speaker, rest, title_or_none)``."""
+    """If ``line`` is a speaker header, return ``(speaker, rest, title_or_none)``.
+
+    Supports Motley Fool ``Name -- Title`` / ``Name:``, bare ``Operator``, and
+    ROIC-style bare names alone on a line (``Sundar Pichai``).
+    """
     line = line.strip()
     if not line:
         return None
@@ -169,7 +186,11 @@ def _match_speaker(line: str) -> tuple[str, str, str | None] | None:
 
     # Name -- Title (only when left side is the person name)
     parsed = parse_participant_line(line)
-    if parsed and re.search(r"[-–—]", line) and ":" not in line.split("—")[0].split("–")[0][:40]:
+    if (
+        parsed
+        and re.search(r"[-–—]", line)
+        and ":" not in line.split("—")[0].split("–")[0][:40]
+    ):
         name, title = parsed
         left = re.split(r"\s*[-–—]{1,2}\s*", line, maxsplit=1)[0].strip()
         if left.lower() == name.lower() and _looks_like_person_name(name):
@@ -192,54 +213,46 @@ def _match_speaker(line: str) -> tuple[str, str, str | None] | None:
         if title and len(title.split()) > 14:
             return None
         # Industry-glossary style "Term: The/A/An definition…"
-        if rest and re.match(r"^(The|A|An|Direct|Existing|Total|Risk|Meta|Apple|"
-                             r"Alphabet|Proposed|Application|Original|High|"
-                             r"Revenue|Tensor)\b", rest):
+        if rest and re.match(
+            r"^(The|A|An|Direct|Existing|Total|Risk|Meta|Apple|"
+            r"Alphabet|Proposed|Application|Original|High|"
+            r"Revenue|Tensor)\b",
+            rest,
+        ):
             if not _DIALOGUE_STARTERS.match(rest):
                 return None
         return speaker, rest, title
+
+    # ROIC / bare-name layout: speaker alone on a line (no colon / dash title)
+    if not looks_like_inline and _is_bare_speaker_name(line):
+        return _normalize_speaker(line), "", None
     return None
 
 
-def _is_qa_transition(line: str) -> bool:
-    """True for a clear prepared-remarks → Q&A break phrase."""
-    return bool(QA_TRANSITION.search(line))
-
-
 def _is_strong_call_turn(line: str) -> bool:
-    """True for Operator / dialogue ``Name: remark`` — ends Fool preamble."""
-    s = line.strip()
-    if re.match(r"^Operator\b", s, re.I):
+    """True for Operator / ``Name:`` / bare-name speaker headers — ends preamble."""
+    hit = _match_speaker(line)
+    if not hit:
+        return False
+    speaker, rest, _title = hit
+    if speaker.lower() == "operator":
         return True
-    m = re.match(
-        r"^(?P<speaker>[A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,3})\s*:\s*(?P<rest>\S.*)$",
-        s,
-    )
-    if not m:
-        return False
-    speaker = m.group("speaker")
-    rest = m.group("rest").strip()
-    if not _looks_like_person_name(speaker):
-        return False
-    # Require a conversational open — glossary defs look like "Term: The/An/…"
-    return bool(_DIALOGUE_STARTERS.match(rest))
+    if rest:
+        return bool(_DIALOGUE_STARTERS.match(rest))
+    # Bare name with no inline rest (ROIC) is a real turn header
+    return True
 
 
 def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
     """Split a transcript into speaker-turn chunks with inherited metadata.
 
-    Each chunk is one continuous speaker block; metadata includes
-    ``speaker_name``, optional ``speaker_role``, and ``section``.
-
-    Section labeling is best-effort: start in prepared remarks; flip to Q&A after
-    a strong Operator / IR transition. Claim extraction does not depend on it.
+    Each chunk is one continuous speaker block. ``section`` is left unset;
+    metadata includes ``speaker_name``, optional ``speaker_role``, and
+    ``call_date``.
     """
     roster = parse_participant_roster(text)
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     chunks: list[Chunk] = []
-    section_kind: SectionKind = "prepared_remarks"
-    pending_qa = False
-    turn_section: SectionKind = "prepared_remarks"
     speaker: str | None = None
     speaker_role: str | None = None
     buf: list[str] = []
@@ -248,12 +261,15 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
     fiscal_period = fiscal_period_from_quarter(meta.fiscal_quarter)
 
     def flush() -> None:
-        nonlocal buf, speaker, speaker_role, section_kind, pending_qa, turn_section
+        nonlocal buf, speaker, speaker_role
         body = "\n".join(buf).strip()
         buf = []
         if not body or speaker is None:
             return
         role = speaker_role or lookup_speaker_title(speaker, roster)
+        # Keep role unset when neither the header nor the roster has a title.
+        if role is not None and not str(role).strip():
+            role = None
         idx = len(chunks)
         chunks.append(
             Chunk(
@@ -271,14 +287,12 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
                 fiscal_period=fiscal_period,
                 is_table=False,
                 text=body,
-                section=SECTION_LABELS[turn_section],
+                section=None,
                 speaker_name=speaker,
                 speaker_role=role,
+                call_date=meta.call_date,
             )
         )
-        if pending_qa:
-            section_kind = "qa"
-            pending_qa = False
 
     for raw in lines:
         line = raw.rstrip()
@@ -295,11 +309,6 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
         if CALL_START_HEADERS.match(stripped):
             in_preamble = False
             in_glossary = False
-            if PREPARED_HEADERS.search(stripped):
-                section_kind = "prepared_remarks"
-            elif _is_qa_transition(stripped):
-                # Explicit "Questions & Answers:" header → Q&A from here on.
-                section_kind = "qa"
             continue
 
         if in_preamble:
@@ -318,25 +327,12 @@ def chunk_transcript(text: str, meta: DocumentMeta) -> list[Chunk]:
             speaker_role = inline_title or lookup_speaker_title(speaker, roster)
             if inline_title:
                 roster.setdefault(speaker.lower(), inline_title)
-            turn_section = section_kind
-            # IR / Operator lines that themselves open Q&A start as Q&A.
-            probe = " ".join(x for x in (rest, speaker, speaker_role) if x)
-            if section_kind != "qa" and _is_qa_transition(probe):
-                if speaker.lower() == "operator" or _IR_ROLE.search(speaker_role or ""):
-                    section_kind = "qa"
-                    turn_section = "qa"
-                else:
-                    pending_qa = True
             buf = [rest] if rest else []
             continue
 
         if speaker is None:
             continue
 
-        if section_kind != "qa" and _is_qa_transition(stripped):
-            # Announcement inside an executive turn: keep this turn prepared,
-            # switch on the next speaker.
-            pending_qa = True
         buf.append(stripped)
 
     flush()

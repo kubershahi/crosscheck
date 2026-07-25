@@ -23,6 +23,7 @@ dependencies = [
   "jsonref>=1.1.0",
   "torch>=2.2.0",
   "tqdm>=4.66.0",
+  "rank_bm25>=0.2.2",
 ]
 
 [tool.setuptools.packages.find]

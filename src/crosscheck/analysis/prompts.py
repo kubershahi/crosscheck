@@ -5,78 +5,106 @@ from __future__ import annotations
 CLAIM_EXTRACTION_SYSTEM = """\
 You are a financial analyst extracting testable assertions from earnings call transcripts.
 
-Source text is C-suite speech (CEO, CFO, president, chairman) in call order — usually \
-opening remarks first, then answers later in the call. Extract atomic, verifiable \
-financial claims that could be checked against an SEC 10-Q or 10-K filing. Focus on:
-- Revenue, earnings, margins, and segment performance
-- Year-over-year or quarter-over-quarter changes with numbers when stated
-- Guidance, outlook, or forward-looking financial targets
-- Balance sheet or cash flow metrics
+You receive the full cleaned earnings-call transcript. Extract atomic, verifiable \
+financial claims that could be checked against the same-period SEC 10-Q or 10-K filing.
+
+Prioritize (reported results for the quarter just discussed):
+- Revenue, earnings, EPS, margins, and segment performance for the current / reported quarter
+- Year-over-year or quarter-over-quarter changes with numbers when stated for that quarter
+- Balance sheet, cash flow, or other metrics presented as actual results for the period
+
+Deprioritize / avoid (forward-looking):
+- Next-quarter guidance, outlook, or expected ranges
+- Full-year forecasts, CapEx plans, expense guidance, or other forward targets
+- Speculative commentary about future demand, investment levels, or "we expect / we anticipate"
 
 Rules:
 - Each claim must be a single, self-contained sentence
-- Attribute each claim to the speaker who made it
-- Skip generic boilerplate, thanks, and non-financial commentary
-- Prefer claims with specific numbers, percentages, or time periods
-- Prefer earlier prepared commentary, but include later answers when they contain \
-strong numeric or testable assertions
-- Ignore analyst questions, operator prompts, and investor-relations transitions
+- Attribute each claim to the speaker who made it (use the name on the speaker line)
+- Prefer statements from company executives (CEO, CFO, and other company speakers)
+- Skip analyst questions, operator prompts, IR logistics, and non-financial chatter
+- Prefer claims with specific numbers, percentages, or time periods tied to reported results
+- Prefer earlier company prepared commentary, but include later answers when they contain \
+strong numeric assertions about the reported quarter
+- If you must choose among candidates, always prefer current-quarter actuals over guidance
 """
 
 NLI_SYSTEM = """\
-You are a financial natural language inference (NLI) analyst.
+Classify a transcript claim against SEC filing passages as Consistent, Contradictory, \
+or Unverifiable.
 
-Given a transcript claim (hypothesis) and retrieved passages from an SEC filing (premise), \
-classify the relationship:
+Period language: fiscal quarters are ~3-month periods. Colloquial names like \
+"December quarter", "June quarter", "Q1", or "first quarter" refer to that full \
+quarter — treat them as matching filing periods labeled "three months ended \
+[month date]" or Qn. Do not mark Contradictory over period wording alone.
 
-- Consistent: the filing supports or entails the claim (same facts, compatible figures)
-- Contradictory: the filing directly conflicts with the claim (opposite direction, \
-incompatible numbers, or explicit denial)
-- Unverifiable: the filing lacks sufficient detail to confirm or deny the claim
+Numbers: treat rounded/scaled equivalents as Consistent \
+($26,340 million ↔ $26.3B; 3.95% ↔ 4%; 10.09% ↔ 10%; ±0.5% relative or ±1¢ EPS). \
+Contradictory only for clear conflicts (wrong direction, incompatible magnitude). \
+Unverifiable if the needed figures are missing.
 
-Rules:
-- Base your judgment ONLY on the provided filing passages — do not use outside knowledge
-- Prefer Unverifiable when retrieval is weak, off-topic, or ambiguous
-- Cite specific filing content in your reasoning
-- confidence_score: 0.0–1.0 reflecting how strongly the filing passages support your label
+Set classification last so it matches your reasoning. Use only the passages given.
 """
 
 
-def claim_extraction_user(company_name: str, exec_text: str, max_claims: int) -> str:
-    """Build the user message for claim extraction."""
+def claim_extraction_user(company_name: str, transcript_text: str, max_claims: int) -> str:
+    """Build the user message for claim extraction from a full transcript."""
     return f"""Company: {company_name}
 
-Executive speech from the earnings call (CEO/CFO and similar roles, in call order):
+Full earnings-call transcript:
 ---
-{exec_text}
+{transcript_text}
 ---
 
-Extract up to {max_claims} testable financial claims from the text above."""
+Extract up to {max_claims} testable financial claims about the reported quarter's \
+actual results. Do not select next-quarter or full-year forward-looking guidance."""
 
 
 def nli_user(
+    *,
     claim: str,
     speaker: str,
-    passages: list[tuple[str, str | None]],
+    ticker: str,
+    company_name: str,
+    fiscal_year: int,
+    fiscal_quarter: str,
+    passages: list[dict[str, str | None]],
 ) -> str:
-    """Build the user message for NLI classification."""
+    """Build the user message for NLI classification.
+
+    Each passage dict may include: text, section, ticker, company_name,
+    quarter_period_label, quarter_months.
+    """
     blocks: list[str] = []
-    for i, (text, section) in enumerate(passages, start=1):
-        section_label = section or "Unknown section"
-        blocks.append(f"Passage {i} [{section_label}]:\n{text.strip()}")
+    for i, passage in enumerate(passages, start=1):
+        meta_parts = [
+            f"TICKER: {passage.get('ticker') or 'Unknown'}",
+            f"COMPANY: {passage.get('company_name') or 'Unknown'}",
+        ]
+        if passage.get("quarter_period_label"):
+            meta_parts.append(f"PERIOD: {passage['quarter_period_label']}")
+        if passage.get("quarter_months"):
+            meta_parts.append(f"QUARTER_MONTHS: {passage['quarter_months']}")
+        if passage.get("section"):
+            meta_parts.append(f"SECTION: {passage['section']}")
+        header = " | ".join(meta_parts)
+        body = (passage.get("text") or "").strip()
+        blocks.append(f"Passage {i} [{header}]:\n{body}")
 
     filing_block = "\n\n".join(blocks) if blocks else "(no passages retrieved)"
 
-    return f"""Transcript claim (hypothesis):
-Speaker: {speaker}
-Claim: {claim}
+    return f"""Claim context:
+TICKER: {ticker}
+COMPANY: {company_name}
+FISCAL_YEAR: {fiscal_year}
+FISCAL_QUARTER: {fiscal_quarter}
+SPEAKER: {speaker}
+CLAIM: {claim}
 
-Retrieved SEC filing passages (premise):
+Filing passages:
 ---
 {filing_block}
 ---
 
-Classify whether the filing passages are Consistent, Contradictory, or Unverifiable \
-relative to the transcript claim. Fill in transcript_claim and source_speaker from the \
-claim above. Populate retrieved_filing_passages and source_sections from the passages above.
+Return classification, confidence_score (0–1), and brief reasoning.
 """

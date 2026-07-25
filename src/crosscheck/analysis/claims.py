@@ -1,4 +1,4 @@
-"""Extract and persist fixed claim sets from executive prepared remarks."""
+"""Extract and persist fixed claim sets from full earnings-call transcripts."""
 
 from __future__ import annotations
 
@@ -12,21 +12,23 @@ from crosscheck.models import DocumentMeta, SavedTranscriptClaims, TranscriptCla
 
 def extract_claims(
     company_name: str,
-    exec_text: str,
+    transcript_text: str,
     *,
     max_claims: int = 10,
 ) -> tuple[TranscriptClaimsList, str]:
-    """Extract up to ``max_claims`` financial claims; return claims and model."""
+    """Extract up to ``max_claims`` financial claims from a full transcript."""
     if not 1 <= max_claims <= 10:
         raise ValueError("max_claims must be between 1 and 10")
-    if not exec_text.strip():
+    if not transcript_text.strip():
         return TranscriptClaimsList(claims=[]), "none"
 
     messages = [
         {"role": "system", "content": CLAIM_EXTRACTION_SYSTEM},
         {
             "role": "user",
-            "content": claim_extraction_user(company_name, exec_text, max_claims),
+            "content": claim_extraction_user(
+                company_name, transcript_text, max_claims
+            ),
         },
     ]
     result, model = complete_structured(

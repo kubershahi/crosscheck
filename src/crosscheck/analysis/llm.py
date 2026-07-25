@@ -6,11 +6,16 @@ from typing import TypeVar
 
 import instructor
 from google import genai
+from google.genai import types
 from pydantic import BaseModel, ValidationError
 
 from crosscheck.config import get_google_api_key, resolve_llm_models
 
 T = TypeVar("T", bound=BaseModel)
+
+# Avoid indefinite hangs on stalled TLS reads (seen as "waiting for response …").
+_HTTP_TIMEOUT_MS = 60_000
+_HTTP_RETRY_ATTEMPTS = 2
 
 _RETRYABLE_KEYWORDS = (
     "rate limit",
@@ -21,10 +26,12 @@ _RETRYABLE_KEYWORDS = (
     "503",
     "504",
     "timeout",
+    "timed out",
     "overloaded",
     "capacity",
     "unavailable",
     "resource_exhausted",
+    "deadline",
 )
 
 _MODE_KEYWORDS = (
@@ -73,7 +80,13 @@ def _is_model_unavailable(exc: Exception) -> bool:
 
 
 def _make_genai_client(mode: instructor.Mode) -> instructor.Instructor:
-    raw = genai.Client(api_key=get_google_api_key())
+    raw = genai.Client(
+        api_key=get_google_api_key(),
+        http_options=types.HttpOptions(
+            timeout=_HTTP_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=_HTTP_RETRY_ATTEMPTS),
+        ),
+    )
     return instructor.from_genai(raw, mode=mode)
 
 
@@ -97,7 +110,7 @@ def complete_structured(
 
     print(
         f"  [llm] start schema={schema} prompt≈{approx_chars:,} chars "
-        f"rank={len(models)} models",
+        f"rank={len(models)} models timeout={_HTTP_TIMEOUT_MS // 1000}s",
         flush=True,
     )
 
@@ -113,7 +126,7 @@ def complete_structured(
             for attempt in range(max_retries):
                 print(
                     f"  [llm]   → mode={mode_name} attempt={attempt + 1}/{max_retries} "
-                    f"waiting for response …",
+                    f"waiting for response (≤{_HTTP_TIMEOUT_MS // 1000}s) …",
                     flush=True,
                 )
                 try:
@@ -152,14 +165,14 @@ def complete_structured(
                     )
                     if _is_model_unavailable(exc):
                         print(
-                            f"  [llm]   model unavailable, skipping remaining modes",
+                            "  [llm]   model unavailable, skipping remaining modes",
                             flush=True,
                         )
                         model_unavailable = True
                         break
                     if _is_mode_error(exc):
                         print(
-                            f"  [llm]   mode unsupported, trying next mode …",
+                            "  [llm]   mode unsupported, trying next mode …",
                             flush=True,
                         )
                         break

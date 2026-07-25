@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Extract and persist fixed transcript claims for one or all companies.
 
+Passes the full cleaned transcript ``.txt`` to the LLM (no speaker-role
+filtering). Chunk JSONL is used only to discover company-periods.
+
 Examples::
 
-    # Every transcript chunk file under data/chunks
+    # Every transcript period discovered under data/chunks
     python scripts/extract_claims.py --n 3
 
     # One ticker or a comma-separated subset
     python scripts/extract_claims.py --ticker AAPL --n 3
     python scripts/extract_claims.py --ticker AAPL,MSFT --n 3 --force
 
-Prerequisite: run ``python scripts/build_chunks.py`` first.
+Prerequisite: run ``python scripts/fetch_corpus.py`` (and ideally
+``python scripts/build_chunks.py`` so periods are discoverable).
 """
 
 from __future__ import annotations
@@ -24,13 +28,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.analysis.claims import extract_claims, save_claims  # noqa: E402
-from crosscheck.analysis.executives import (  # noqa: E402
-    executive_source_text,
-    is_executive_chunk,
-)
+from crosscheck.chunking.pipeline import resolve_transcript_path  # noqa: E402
 from crosscheck.chunking.store import iter_company_chunk_files, load_chunks_jsonl  # noqa: E402
 from crosscheck.config import claims_path, get_llm_profile, resolve_llm_models  # noqa: E402
-from crosscheck.models import DocumentMeta  # noqa: E402
+from crosscheck.models import Chunk, DocumentMeta  # noqa: E402
 
 
 def _parse_tickers(value: str | None) -> set[str] | None:
@@ -41,8 +42,26 @@ def _parse_tickers(value: str | None) -> set[str] | None:
     return tickers or None
 
 
+def _load_transcript_text(
+    period: DocumentMeta,
+    chunks: list[Chunk],
+) -> tuple[str, str]:
+    """Return ``(text, source_label)`` preferring raw ``.txt``, else chunk join."""
+    txt_path = resolve_transcript_path(
+        period.ticker,
+        fiscal_year=period.fiscal_year,
+        fiscal_quarter=period.fiscal_quarter,
+    )
+    if txt_path.exists():
+        text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if text:
+            return text, str(txt_path)
+    joined = "\n\n".join(c.text.strip() for c in chunks if c.text.strip()).strip()
+    return joined, f"concatenated {len(chunks)} transcript chunks"
+
+
 def main() -> None:
-    """Extract stable claim sets from transcript chunks."""
+    """Extract stable claim sets from full transcripts."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -104,15 +123,18 @@ def main() -> None:
             continue
         first = chunks[0]
         if not first.fiscal_period.startswith("Q"):
-            print(f"\n[skip] invalid transcript fiscal period: {transcript_path}", flush=True)
+            print(
+                f"\n[skip] invalid transcript fiscal period: {transcript_path}",
+                flush=True,
+            )
             continue
         period = DocumentMeta(
             ticker=first.ticker,
             company_name=first.company_name or first.ticker,
             fiscal_year=first.fiscal_year,
-            fiscal_quarter=int(first.fiscal_period[1:]),
+            fiscal_quarter=first.fiscal_period,
         )
-        label = f"{period.ticker} FY{period.fiscal_year} Q{period.fiscal_quarter}"
+        label = f"{period.ticker} FY{period.fiscal_year} {period.fiscal_quarter}"
         out = claims_path(
             period.ticker,
             period.fiscal_year,
@@ -122,33 +144,25 @@ def main() -> None:
             f"\n[{file_idx}/{len(transcript_files)}] {label}",
             flush=True,
         )
-        print(f"  source: {transcript_path}", flush=True)
 
         if out.exists() and not args.force:
             print(f"  skip: claims already exist at {out}", flush=True)
             continue
 
-        executive_chunks = [c for c in chunks if is_executive_chunk(c)]
-        executive_text = executive_source_text(chunks)
-        if not executive_text:
-            print("  skip: no CEO/CFO (or similar) executive turns found", flush=True)
+        transcript_text, source = _load_transcript_text(period, chunks)
+        if not transcript_text:
+            print("  skip: empty transcript text", flush=True)
             continue
 
-        early = [
-            f"{c.speaker_name} ({c.speaker_role or '?'})"
-            for c in executive_chunks[:3]
-        ]
+        print(f"  source: {source}", flush=True)
         print(
-            f"  executive turns: {len(executive_chunks)} "
-            f"({len(executive_text):,} chars to LLM)",
+            f"  transcript: {len(transcript_text):,} chars to LLM",
             flush=True,
         )
-        if early:
-            print(f"  early speakers: {', '.join(early)}", flush=True)
         print("  calling LLM for structured claims …", flush=True)
         claims, model = extract_claims(
             period.company_name,
-            executive_text,
+            transcript_text,
             max_claims=args.n,
         )
         saved = save_claims(period, claims, model_used=model)

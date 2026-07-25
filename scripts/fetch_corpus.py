@@ -3,11 +3,11 @@
 
 Examples::
 
-    # Fetch filing + transcript for AAPL (from data/manifests/companies.yml)
-    python scripts/fetch_corpus.py --ticker AAPL
-
     # All rows with include: true in the manifest
     python scripts/fetch_corpus.py
+    
+    # Fetch filing + transcript for AAPL (from data/manifests/companies.yml)
+    python scripts/fetch_corpus.py --ticker AAPL
 
     # Force a ticker even if include: false
     python scripts/fetch_corpus.py --ticker MSFT
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.ingest.edgar import fetch_filing  # noqa: E402
-from crosscheck.ingest.motley_fool import fetch_transcript  # noqa: E402
+from crosscheck.ingest.transcript import fetch_transcript  # noqa: E402
 from crosscheck.manifest import (  # noqa: E402
     default_manifest_path,
     filter_manifest,
@@ -87,15 +87,16 @@ def main() -> None:
     )
     if not rows:
         print(
-            "No matching companies in manifest. "
-            "Set include: true in companies.yml, pass --ticker, or use --all."
+            "No matching periods in manifest. "
+            "Set company include: true and quarters.*.fetch: true, "
+            "pass --ticker (with fetch: true quarters), or use --all."
         )
         sys.exit(1)
 
+    labels = [f"{r.ticker} Q{r.fiscal_quarter}" for r in rows]
     print(
-        f"Fetching {len(rows)} compan"
-        f"{'y' if len(rows) == 1 else 'ies'}: "
-        f"{', '.join(r.ticker for r in rows)}"
+        f"Fetching {len(rows)} period"
+        f"{'' if len(rows) == 1 else 's'}: {', '.join(labels)}"
     )
 
     for period in rows:

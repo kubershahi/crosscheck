@@ -1,103 +1,226 @@
-# Dual-ingest manifest: EDGAR filings + Motley Fool transcript URLs.
-# Paste fool.com /earnings/call-transcripts/ links per company-period.
+# Dual-ingest manifest: one entry per company per fiscal year.
+# Per-quarter fetch flags + transcript URLs.
 #
-# name: colloquial name people know (stored on every chunk as company_name)
-# form: null → auto (Q4 → 10-K, Q1–Q3 → 10-Q)
-# include: true → fetch/chunk by default; false → skipped unless --ticker is passed
+# name: colloquial name (stored on chunks as company_name)
+# include: true → company is selected by default fetch (unless --ticker / --all)
+# quarters.Qn.fetch: true → that quarter is expanded into a fetch job
+# quarters.Qn.form: null → auto (Q4 → 10-K, Q1–Q3 → 10-Q)
+# quarters.Qn.transcript_url: Motley Fool preferred; ROIC.ai / other hosts ok
+#   (parser is chosen from the URL host — Fool, ROIC, or general HTML)
 
 companies:
   - ticker: AAPL
     name: Apple
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: true
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/31/apple-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/01/30/apple-aapl-q1-2025-earnings-call-transcript/"
+      Q2:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/05/04/aple-q2-2025-earnings-transcript/"
+      Q3:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/01/apple-aapl-q3-2025-earnings-call-transcript/"
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/31/apple-q4-2025-earnings-call-transcript/"
 
   - ticker: MSFT
     name: Microsoft
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: true
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/05/microsoft-msft-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/10/30/microsoft-msft-q1-2025-earnings-call-transcript/"
+      Q2:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/01/29/microsoft-msft-q2-2025-earnings-call-transcript/"
+      Q3:
+        fetch: true
+        transcript_url: "https://www.roic.ai/quote/MSFT/transcripts/2025-year/3-quarter"
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/05/microsoft-msft-q4-2025-earnings-call-transcript/"
 
   - ticker: NVDA
     name: Nvidia
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: true
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/nvidia-nvda-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/05/29/nvidia-nvda-q1-2025-earnings-call-transcript/"
+      Q2:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/08/28/nvidia-nvda-q2-2025-earnings-call-transcript/"
+      Q3:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/11/20/nvidia-nvda-q3-2025-earnings-call-transcript/"
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/nvidia-nvda-q4-2025-earnings-call-transcript/"
 
   - ticker: GOOGL
-    name: Google
+    name: Alphabet
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: true
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/04/alphabet-googl-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: true
+        transcript_url: "https://www.roic.ai/quote/GOOG/transcripts/2025-year/1-quarter"
+      Q2:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/07/23/alphabet-googl-q2-2025-earnings-call-transcript/"
+      Q3:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/30/alphabet-goog-q3-2025-earnings-call-transcript/"
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/04/alphabet-googl-q4-2025-earnings-call-transcript/"
 
   - ticker: META
     name: Meta
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: true
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/meta-meta-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: true
+        transcript_url: "https://www.roic.ai/quote/META:PE/transcripts/2025-year/1-quarter"
+      Q2:
+        fetch: true
+        transcript_url: "https://www.roic.ai/quote/META:PE/transcripts/2025-year/2-quarter"
+      Q3:
+        fetch: true
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/29/meta-platforms-meta-q3-2025-earnings-call-transcript/"
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/meta-meta-q4-2025-earnings-call-transcript/"
 
   - ticker: AMZN
     name: Amazon
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/05/amazon-amzn-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/05/amazon-amzn-q4-2025-earnings-call-transcript/"
 
   - ticker: TSLA
     name: Tesla
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/tesla-tsla-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/tesla-tsla-q4-2025-earnings-call-transcript/"
 
   - ticker: AVGO
     name: Broadcom
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/12/12/broadcom-avgo-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/12/12/broadcom-avgo-q4-2025-earnings-call-transcript/"
 
   - ticker: ORCL
     name: Oracle
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.tickertrends.io/transcripts/ORCL/Q4-earnings-transcript-2025"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.tickertrends.io/transcripts/ORCL/Q4-earnings-transcript-2025"
 
   - ticker: AMD
     name: AMD
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/03/amd-amd-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/03/amd-amd-q4-2025-earnings-call-transcript/"
 
   - ticker: JPM
     name: JPMorgan
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/15/j-p-morgan-chase-jpm-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/15/j-p-morgan-chase-jpm-q4-2025-earnings-call-transcript/"
 
   - ticker: CRM
     name: Salesforce
     fiscal_year: 2025
-    fiscal_quarter: 4
-    form: null
     include: false
-    transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/salesforce-crm-q4-2025-earnings-call-transcript/"
+    quarters:
+      Q1:
+        fetch: false
+        transcript_url: null
+      Q2:
+        fetch: false
+        transcript_url: null
+      Q3:
+        fetch: false
+        transcript_url: null
+      Q4:
+        fetch: false
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/02/26/salesforce-crm-q4-2025-earnings-call-transcript/"

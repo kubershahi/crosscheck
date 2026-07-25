@@ -30,6 +30,13 @@ from crosscheck.retrieval.embeddings import (
     load_embedding_model,
     resolve_device,
 )
+from crosscheck.retrieval.hybrid import (
+    Bm25Index,
+    bm25_retrieve,
+    build_bm25_index,
+    period_matches,
+    rrf_fuse,
+)
 
 EMBEDDING_DIMENSION = 1024
 
@@ -52,6 +59,7 @@ class CorpusIndex:
     index: faiss.IndexFlatIP
     chunks: list[IndexedChunk]
     embedding_model: str
+    bm25: Bm25Index | None = None
 
 
 # Backward-compatible alias used by older call sites.
@@ -130,10 +138,10 @@ def merge_corpus_chunks(corpus: CorpusKind, *, force: bool = False) -> Path:
                     if chunk.doc_type not in allowed:
                         continue
                     row = IndexedChunk(
-                        **chunk.model_dump(),
+                        **chunk.model_dump(exclude_none=True),
                         global_id=global_id,
                     )
-                    fh.write(row.model_dump_json())
+                    fh.write(row.model_dump_json(exclude_none=True))
                     fh.write("\n")
                     global_id += 1
 
@@ -402,16 +410,18 @@ def load_corpus_index(corpus: CorpusKind) -> CorpusIndex:
             "Rebuild with --force."
         )
     manifest = json.loads(corpus_manifest_path(corpus).read_text(encoding="utf-8"))
+    bm25 = build_bm25_index(chunks) if corpus == "filings" else None
     return CorpusIndex(
         corpus=corpus,
         index=index,
         chunks=chunks,
         embedding_model=manifest.get("embedding_model", EMBEDDING_MODEL),
+        bm25=bm25,
     )
 
 
 def load_filings_index() -> CorpusIndex:
-    """Load the filings-only index used by NLI."""
+    """Load the filings-only index used by NLI (includes in-memory BM25)."""
     return load_corpus_index("filings")
 
 
@@ -429,6 +439,7 @@ def retrieve(
     ticker: str | None = None,
     doc_types: set[str] | None = None,
     fiscal_year: int | None = None,
+    fiscal_quarter: str | None = None,
     candidate_multiplier: int = 20,
 ) -> list[tuple[IndexedChunk, float]]:
     """Embed a query and return top-k chunks, optionally filtered by metadata."""
@@ -451,7 +462,64 @@ def retrieve(
             continue
         if fiscal_year is not None and chunk.fiscal_year != fiscal_year:
             continue
+        if not period_matches(chunk.fiscal_period, fiscal_quarter):
+            continue
         results.append((chunk, float(score)))
         if len(results) >= k:
             break
     return results
+
+
+def hybrid_retrieve(
+    query: str,
+    corpus: CorpusIndex,
+    model: SentenceTransformer,
+    *,
+    k: int = 5,
+    ticker: str | None = None,
+    fiscal_year: int | None = None,
+    fiscal_quarter: str | None = None,
+    doc_types: set[str] | None = None,
+    candidate_multiplier: int = 20,
+    rrf_k: int = 60,
+) -> list[tuple[IndexedChunk, float]]:
+    """Dense FAISS + BM25, each filtered, then RRF-fuse to top-k.
+
+    Each channel overfetches ``max(k, 20)`` (or denser FAISS overfetch via
+    ``candidate_multiplier``), then RRF merges the filtered ranked lists.
+    """
+    if k < 1:
+        return []
+
+    channel_k = max(k, 20)
+    dense = retrieve(
+        query,
+        corpus,
+        model,
+        k=channel_k,
+        ticker=ticker,
+        doc_types=doc_types,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        candidate_multiplier=candidate_multiplier,
+    )
+
+    sparse: list[tuple[IndexedChunk, float]] = []
+    if corpus.bm25 is not None:
+        sparse = bm25_retrieve(
+            query,
+            corpus.bm25,
+            k=channel_k,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            doc_types=doc_types,
+        )
+
+    if not dense and not sparse:
+        return []
+    if not sparse:
+        return dense[:k]
+    if not dense:
+        return sparse[:k]
+    return rrf_fuse([dense, sparse], k=rrf_k, top_n=k)

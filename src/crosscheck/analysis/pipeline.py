@@ -15,7 +15,11 @@ from crosscheck.config import (
 )
 from crosscheck.models import DocumentMeta, PipelineReport
 from crosscheck.retrieval.embeddings import load_embedding_model, resolve_device
-from crosscheck.retrieval.index import filings_index_path, load_filings_index, retrieve
+from crosscheck.retrieval.index import (
+    filings_index_path,
+    hybrid_retrieve,
+    load_filings_index,
+)
 from crosscheck.retrieval.rerank import load_reranker, rerank_claim_passages
 
 
@@ -31,9 +35,9 @@ def run_pipeline(
     use_reranker: bool = True,
     rerank_pool_k: int | None = None,
 ) -> PipelineReport:
-    """Load fixed claims, then run dense retrieval and NLI for one period."""
+    """Load fixed claims, then run hybrid retrieval and NLI for one period."""
     total_steps = 5 if use_reranker else 4
-    label = f"{period.ticker} FY{period.fiscal_year} Q{period.fiscal_quarter}"
+    label = f"{period.ticker} FY{period.fiscal_year} {period.fiscal_quarter}"
     pool_k = rerank_pool_k if rerank_pool_k is not None else max(top_k * 10, 20)
     if pool_k < top_k:
         raise ValueError("rerank_pool_k must be greater than or equal to top_k")
@@ -52,7 +56,11 @@ def run_pipeline(
 
     _step(1, total_steps, f"Load filings index from {filings_index_path()}")
     filings = load_filings_index()
-    print(f"    total chunks in filings index={len(filings.chunks)}", flush=True)
+    print(
+        f"    total chunks in filings index={len(filings.chunks)}"
+        f"  bm25={'yes' if filings.bm25 else 'no'}",
+        flush=True,
+    )
 
     _step(2, total_steps, "Load embedding model")
     model = load_embedding_model()
@@ -80,7 +88,8 @@ def run_pipeline(
     _step(
         classify_step,
         total_steps,
-        f"Dense retrieve{' + rerank' if use_reranker else ''} + NLI classify "
+        f"Hybrid retrieve (dense+BM25 RRF)"
+        f"{' + rerank' if use_reranker else ''} + NLI classify "
         f"({len(saved_claims.claims)} claims)",
     )
     findings = []
@@ -88,31 +97,33 @@ def run_pipeline(
 
     for i, claim in enumerate(saved_claims.claims, start=1):
         preview = claim.claim[:72] + ("…" if len(claim.claim) > 72 else "")
-        dense_k = pool_k if use_reranker else top_k
+        retrieve_k = pool_k if use_reranker else top_k
         print(
-            f"    [{i}/{len(saved_claims.claims)}] dense retrieve k={dense_k}: {preview}",
+            f"    [{i}/{len(saved_claims.claims)}] hybrid retrieve "
+            f"(dense+BM25 RRF) k={retrieve_k}: {preview}",
             flush=True,
         )
 
-        dense_retrieved = retrieve(
+        hybrid_retrieved = hybrid_retrieve(
             claim.claim,
             filings,
             model,
-            k=dense_k,
+            k=retrieve_k,
             ticker=period.ticker,
             fiscal_year=period.fiscal_year,
+            fiscal_quarter=period.fiscal_quarter,
         )
-        retrieved = dense_retrieved
+        retrieved = hybrid_retrieved
         if use_reranker and reranker is not None:
             retrieved = rerank_claim_passages(
                 claim.claim,
-                dense_retrieved,
+                hybrid_retrieved,
                 top_k=top_k,
                 model=reranker,
             )
             print(
                 f"    [{i}/{len(saved_claims.claims)}] reranked "
-                f"{len(dense_retrieved)} → {len(retrieved)} passages",
+                f"{len(hybrid_retrieved)} → {len(retrieved)} passages",
                 flush=True,
             )
         print(
@@ -120,7 +131,7 @@ def run_pipeline(
             flush=True,
         )
 
-        finding, nli_model = classify_claim(claim, retrieved)
+        finding, nli_model = classify_claim(claim, retrieved, period=period)
         findings.append(finding)
         models_used.add(nli_model)
         print(

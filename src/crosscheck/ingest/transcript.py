@@ -1,16 +1,17 @@
 """Fetch and clean earnings-call transcript pages.
 
-Primary source is Motley Fool; other hosts (e.g. TickerTrends) use a generic
-DOM / JSON extraction pass with the same speaker-turn formatting.
+Prefer Motley Fool links in the manifest; ROIC.ai (or other hosts) work when
+Fool is unavailable. ``extract_transcript`` picks Fool / ROIC / general HTML
+parsing from the URL host.
 
 Motley Fool pages often include preamble blocks (Date, Call participants,
-Industry glossary). Those are kept in the cleaned ``.txt``; AI Takeaways /
-Summary / Risks are dropped. Call-body start is flexible: full conference
-marker, prepared remarks, or the first speaker / Operator line.
+Industry glossary). Cleaned ``.txt`` keeps only the Date header plus the call
+body — participants stay in ``.meta.json`` (speaker attribution is already on
+each turn). AI Takeaways / Summary / Risks are dropped.
 
 Writes::
 
-    data/raw/transcripts/{fiscal_year}/{TICKER}/FY{YYYY}_Q{N}.fool.html
+    data/raw/transcripts/{fiscal_year}/{TICKER}/FY{YYYY}_Q{N}.html
     data/raw/transcripts/{fiscal_year}/{TICKER}/FY{YYYY}_Q{N}.txt
     data/raw/transcripts/{fiscal_year}/{TICKER}/FY{YYYY}_Q{N}.meta.json
 """
@@ -70,10 +71,26 @@ _HDR_FULL = re.compile(
 _HDR_PREPARED = re.compile(r"^prepared\s+remarks?:?\s*$", re.I)
 _HDR_QA = re.compile(r"^questions?\s*(?:&|and)\s*answers?:?\s*$", re.I)
 
-# Keep in cleaned text
+# Keep in meta / for section detection; not written into cleaned .txt body
 KEEP_PREAMBLE = ("date", "call_participants", "industry_glossary")
 # Drop AI editorial blocks
 DROP_SECTIONS = {"takeaways", "summary", "risks", "contents"}
+
+# Bare speaker name on its own line (common on ROIC.ai): "Sundar Pichai"
+# Requires lowercase letters in each name token so tickers like "GOOG" do not match.
+SPEAKER_BARE_NAME = re.compile(
+    r"^(?:Operator|[A-Z][a-z][A-Za-z.'\-]*(?:\s+[A-Z][a-z][A-Za-z.'\-]*){0,4})$"
+)
+
+# "April 24, 2025" / "24 April 2025"
+_CALL_DATE_IN_TEXT = re.compile(
+    r"\b(?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+\d{1,2},?\s+\d{4}\b"
+    r"|\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+\d{4}\b",
+    re.I,
+)
+_PERIOD_ONLY_DATE = re.compile(r"^Q[1-4]\s+\d{4}$", re.I)
 
 NOISE_LINE = [
     re.compile(r"^accessibility menu$", re.I),
@@ -86,6 +103,11 @@ NOISE_LINE = [
     re.compile(r"^duration\s*[-–—:]", re.I),
     re.compile(r"^need a quote from a motley fool", re.I),
     re.compile(r"^---%$"),
+    re.compile(r"^earnings call transcripts?$", re.I),
+    re.compile(r"^open transcript list$", re.I),
+    re.compile(r"^api\s+chatgpt\s+google sheets$", re.I),
+    re.compile(r"market cap$", re.I),
+    re.compile(r"^nasdaq global select$", re.I),
 ]
 
 SKIP_SPEAKER_NAMES = {
@@ -93,6 +115,7 @@ SKIP_SPEAKER_NAMES = {
     "contents",
     "image source",
     "accessibility menu",
+    "usd",
 }
 
 
@@ -139,16 +162,20 @@ def transcript_paths(period: CompanyPeriod) -> dict[str, Path]:
     """Resolve raw HTML / cleaned txt / meta paths for a company-period."""
     out_dir = transcript_dir(period.ticker, period.fiscal_year)
     stem = transcript_stem(period)
+    html = out_dir / f"{stem}.html"
+    legacy_fool = out_dir / f"{stem}.fool.html"
     return {
         "dir": out_dir,
         "txt": out_dir / f"{stem}.txt",
-        "html": out_dir / f"{stem}.fool.html",
+        "html": html,
+        # Older fetches used ``.fool.html`` regardless of host.
+        "html_legacy": legacy_fool,
         "meta": out_dir / f"{stem}.meta.json",
     }
 
 
 def is_speaker_line(line: str) -> bool:
-    """True if ``line`` looks like a speaker header (dash or colon styles)."""
+    """True if ``line`` looks like a speaker header (dash, colon, or bare name)."""
     s = line.strip()
     if not s:
         return False
@@ -159,6 +186,13 @@ def is_speaker_line(line: str) -> bool:
     if SPEAKER_DASH.match(s):
         name = re.split(r"\s*[-–—]{1,2}\s*", s, maxsplit=1)[0].strip().lower()
         return name not in SKIP_SPEAKER_NAMES
+    # ROIC / generic: speaker name alone on a line (Title Case, no sentence).
+    if SPEAKER_BARE_NAME.match(s) and s.lower() not in SKIP_SPEAKER_NAMES:
+        # Reject lines that look like short sentences ("Thank You") when
+        # followed by punctuation elsewhere — bare names have no trailing period.
+        if s.endswith((".", "!", "?", ",")):
+            return False
+        return True
     return False
 
 
@@ -445,22 +479,69 @@ def _fallback_period_label(fiscal_year: int, fiscal_quarter: int) -> str:
     return f"Q{fiscal_quarter} {fiscal_year}"
 
 
+def _extract_call_date_from_html(html: str) -> str | None:
+    """Best-effort call date from page title / OpenGraph / published_time.
+
+    ROIC.ai pages typically put the call date in the ``<title>`` and
+    ``article:published_time`` meta tag.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    for attr in ("property", "name"):
+        for key in (
+            "article:published_time",
+            "og:updated_time",
+            "publish_date",
+            "date",
+        ):
+            tag = soup.find("meta", attrs={attr: key})
+            if tag and tag.get("content"):
+                content = str(tag["content"]).strip()
+                # Prefer ISO → readable
+                if re.match(r"^\d{4}-\d{2}-\d{2}", content):
+                    try:
+                        dt = datetime.fromisoformat(content.replace("Z", "+00:00"))
+                        return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+                    except ValueError:
+                        return content[:10]
+                match = _CALL_DATE_IN_TEXT.search(content)
+                if match:
+                    return match.group(0)
+
+    og_title = soup.find("meta", property="og:title")
+    description = soup.find("meta", attrs={"name": "description"})
+    for candidate in (
+        soup.title.string if soup.title else None,
+        og_title.get("content") if og_title else None,
+        description.get("content") if description else None,
+    ):
+        if not candidate:
+            continue
+        match = _CALL_DATE_IN_TEXT.search(str(candidate))
+        if match:
+            return match.group(0)
+    return None
+
+
 def _harvest_participants_from_body(body: list[str]) -> list[dict[str, str]]:
-    """Collect Name -- Title pairs from in-call speaker headers (meta only)."""
+    """Collect speaker names/titles from in-call headers (meta only)."""
     rebuilt: list[dict[str, str]] = []
     seen: set[str] = set()
     for line in body:
         if not is_speaker_line(line):
             continue
         parsed = parse_participant_line(line)
-        if not parsed:
+        if parsed:
+            name, title = parsed
+        elif SPEAKER_BARE_NAME.match(line.strip()):
+            name, title = line.strip(), ""
+        else:
             continue
-        name, title = parsed
         key = _norm_name(name)
-        if key in seen:
+        if key in seen or key == "operator":
             continue
         seen.add(key)
-        rebuilt.append({"name": name, "title": title})
+        rebuilt.append({"name": name, "title": title} if title else {"name": name, "title": ""})
     return rebuilt
 
 
@@ -468,12 +549,9 @@ def assemble_transcript_document(
     *,
     call_date: str | None,
     participants: list[dict[str, str]],
-    glossary_lines: list[str],
     body_lines: list[str],
     fiscal_year: int,
     fiscal_quarter: int,
-    participants_section_found: bool,
-    glossary_section_found: bool,
 ) -> TranscriptExtract:
     """Build the canonical cleaned ``.txt`` layout.
 
@@ -481,16 +559,17 @@ def assemble_transcript_document(
 
         Date
         …
-        Call participants
-        …
-        Industry glossary
-        …
+
         Full Conference Call Transcript
+
+        Speaker
         …
+
+    Call participants / industry glossary are omitted from the text — they are
+    stored in meta only. Speaker names already appear on each turn.
     """
     out: list[str] = []
 
-    # 1) Date
     out.append("Date")
     if call_date:
         out.append(call_date)
@@ -500,24 +579,6 @@ def assemble_transcript_document(
         out.append(date_meta)
     out.append("")
 
-    # 2) Call participants
-    out.append("Call participants")
-    if participants_section_found and participants:
-        for p in participants:
-            out.append(f"{p['name']} — {p['title']}")
-    else:
-        out.append("section not found")
-    out.append("")
-
-    # 3) Industry glossary
-    out.append("Industry glossary")
-    if glossary_section_found and glossary_lines:
-        out.extend(glossary_lines)
-    else:
-        out.append("section not found")
-    out.append("")
-
-    # 4) Call body
     out.append("Full Conference Call Transcript")
     out.append("")
     out.extend(_format_speaker_turns(body_lines))
@@ -525,7 +586,6 @@ def assemble_transcript_document(
     text = "\n".join(out).strip() + "\n"
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Meta still gets titles from in-call dash headers when the roster block was missing
     meta_participants = list(participants) if participants else _harvest_participants_from_body(
         body_lines
     )
@@ -543,7 +603,7 @@ def extract_motley_fool(
     fiscal_year: int,
     fiscal_quarter: int,
 ) -> TranscriptExtract:
-    """Section-aware Motley Fool extraction (preamble + flexible call body)."""
+    """Section-aware Motley Fool extraction (date + flexible call body)."""
     soup = BeautifulSoup(html, "lxml")
     root = _article_root(soup)
     _strip_noise(root)
@@ -555,18 +615,17 @@ def extract_motley_fool(
         if line.strip():
             call_date = line.strip()
             break
+    html_date = _extract_call_date_from_html(html)
+    # Prefer a real calendar date over a bare "Q1 2025" period label.
+    if html_date and (not call_date or _PERIOD_ONLY_DATE.match(call_date)):
+        call_date = html_date
+    elif not call_date:
+        call_date = html_date
 
     participant_lines = [
         ln for ln in (sections.get("call_participants") or []) if ln.strip()
     ]
     participants = _participants_as_dicts(participant_lines)
-    # Section "found" only when we can parse at least one Name — Title row
-    participants_section_found = bool(participants)
-
-    glossary_lines = [
-        ln for ln in (sections.get("industry_glossary") or []) if ln.strip()
-    ]
-    glossary_section_found = bool(glossary_lines)
 
     body = _call_body_lines(sections, lines)
     body = [ln for ln in body if not _is_noise_line(ln) or is_speaker_line(ln)]
@@ -574,12 +633,9 @@ def extract_motley_fool(
     return assemble_transcript_document(
         call_date=call_date,
         participants=participants,
-        glossary_lines=glossary_lines,
         body_lines=body,
         fiscal_year=fiscal_year,
         fiscal_quarter=fiscal_quarter,
-        participants_section_found=participants_section_found,
-        glossary_section_found=glossary_section_found,
     )
 
 
@@ -657,6 +713,8 @@ def extract_transcript(
     fiscal_quarter: int,
 ) -> TranscriptExtract:
     """Parse transcript HTML into the canonical cleaned ``.txt`` layout."""
+    page_date = _extract_call_date_from_html(html)
+
     if looks_like_motley_fool(html, url):
         extracted = extract_motley_fool(
             html, fiscal_year=fiscal_year, fiscal_quarter=fiscal_quarter
@@ -666,15 +724,22 @@ def extract_transcript(
 
     next_body = _extract_from_next_data(html)
     if next_body and sum(len(x) for x in next_body) >= MIN_TRANSCRIPT_CHARS:
+        start = 0
+        for i, line in enumerate(next_body):
+            if line.strip().lower() == "operator" or is_speaker_line(line):
+                start = i
+                break
+        body = [
+            ln
+            for ln in next_body[start:]
+            if not _is_noise_line(ln) or is_speaker_line(ln)
+        ]
         return assemble_transcript_document(
-            call_date=None,
+            call_date=page_date,
             participants=[],
-            glossary_lines=[],
-            body_lines=next_body,
+            body_lines=body,
             fiscal_year=fiscal_year,
             fiscal_quarter=fiscal_quarter,
-            participants_section_found=False,
-            glossary_section_found=False,
         )
 
     soup = BeautifulSoup(html, "lxml")
@@ -687,19 +752,23 @@ def extract_transcript(
             start = i + 1
             break
     else:
+        # Prefer Operator / first speaker; skip ROIC chrome above the call.
         for i, line in enumerate(lines):
+            if line.strip().lower() == "operator" or (
+                is_speaker_line(line) and SPEAKER_BARE_NAME.match(line.strip())
+            ):
+                start = i
+                break
             if is_speaker_line(line):
                 start = i
                 break
+    body = [ln for ln in lines[start:] if not _is_noise_line(ln) or is_speaker_line(ln)]
     return assemble_transcript_document(
-        call_date=None,
+        call_date=page_date,
         participants=[],
-        glossary_lines=[],
-        body_lines=lines[start:],
+        body_lines=body,
         fiscal_year=fiscal_year,
         fiscal_quarter=fiscal_quarter,
-        participants_section_found=False,
-        glossary_section_found=False,
     )
 
 
@@ -713,16 +782,18 @@ def validate_transcript_text(text: str) -> None:
     speaker_hits = count_speaker_headers(text)
     if speaker_hits < 2:
         raise ValueError(
-            f"Expected speaker headers like 'Name:' or 'Name -- Title'; "
+            f"Expected speaker headers like 'Name:' / 'Name -- Title' / bare name; "
             f"found {speaker_hits}. Extraction likely failed."
         )
 
 
 def source_label(url: str) -> str:
     """Short host-based source tag for meta.json."""
-    host = urlparse(url).netloc.lower()
+    host = urlparse(url).netloc.lower().removeprefix("www.")
     if "fool.com" in host:
         return "motley_fool"
+    if "roic.ai" in host:
+        return "roic_ai"
     if "tickertrends" in host:
         return "tickertrends"
     return host or "unknown"
@@ -734,7 +805,7 @@ def fetch_transcript(
     force: bool = False,
     allow_existing_txt: bool = True,
 ) -> Path:
-    """Fetch transcript URL for a company period; return cleaned .txt path."""
+    """Fetch ``transcript_url`` for a company period; return cleaned ``.txt``."""
     url = period.transcript_url_str()
     paths = transcript_paths(period)
     paths["dir"].mkdir(parents=True, exist_ok=True)
@@ -751,12 +822,18 @@ def fetch_transcript(
         return paths["txt"]
 
     # Re-parse saved HTML when present (avoids re-hitting the site after failed validate)
-    if paths["html"].exists() and not force:
-        html = paths["html"].read_text(encoding="utf-8")
+    html_path = paths["html"]
+    legacy_html = paths["html_legacy"]
+    if html_path.exists() and not force:
+        html = html_path.read_text(encoding="utf-8")
+    elif legacy_html.exists() and not force:
+        html = legacy_html.read_text(encoding="utf-8")
+        html_path = legacy_html
     else:
         resp = _get(url)
         html = resp.text
         paths["html"].write_text(html, encoding="utf-8")
+        html_path = paths["html"]
 
     extracted = extract_transcript(
         html,
@@ -774,12 +851,12 @@ def fetch_transcript(
         "ticker": period.ticker,
         "company_name": period.name,
         "fiscal_year": period.fiscal_year,
-        "fiscal_quarter": period.fiscal_quarter,
+        "fiscal_quarter": f"Q{period.fiscal_quarter}",
         "chars": len(extracted.text),
         "call_date": extracted.call_date,
         "call_participants": extracted.participants,
-        "raw_html": str(paths["html"]),
+        "raw_html": str(html_path),
         "cleaned_txt": str(paths["txt"]),
     }
-    paths["meta"].write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    paths["meta"].write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return paths["txt"]

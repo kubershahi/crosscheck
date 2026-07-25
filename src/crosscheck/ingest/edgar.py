@@ -1,6 +1,7 @@
 """SEC EDGAR filing download helpers.
 
-Resolves ticker → CIK, finds a matching 10-K/10-Q, and downloads the primary
+Resolves ticker → CIK, finds a matching 10-K/10-Q for a fiscal year **and**
+quarter (using the company's SEC ``fiscalYearEnd``), and downloads the primary
 HTML document into ``data/raw/filings/{fiscal_year}/{TICKER}/``.
 
 Uses the public data.sec.gov / www.sec.gov APIs with a compliant User-Agent
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -111,14 +113,127 @@ def _filing_list(submissions: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
-def _year_from_report_date(report_date: str) -> int | None:
-    """Parse YYYY from an EDGAR ISO-ish date string."""
-    if not report_date or len(report_date) < 4:
+def _parse_fye_month(fiscal_year_end: str | None) -> int:
+    """Parse SEC ``fiscalYearEnd`` (``MMDD``) to month 1–12; default December."""
+    if not fiscal_year_end or len(fiscal_year_end) < 2:
+        return 12
+    try:
+        month = int(fiscal_year_end[:2])
+    except ValueError:
+        return 12
+    if 1 <= month <= 12:
+        return month
+    return 12
+
+
+def _parse_iso_date(value: str) -> date | None:
+    """Parse ``YYYY-MM-DD`` (or longer ISO) into a date."""
+    if not value or len(value) < 10:
         return None
     try:
-        return int(report_date[:4])
+        return date.fromisoformat(value[:10])
     except ValueError:
         return None
+
+
+def quarter_end_month(fye_month: int, fiscal_quarter: int) -> int:
+    """Return the calendar month when ``fiscal_quarter`` typically ends.
+
+    Quarters advance 3 months from the fiscal year-end month:
+    Q1 = FYE+3, Q2 = FYE+6, Q3 = FYE+9, Q4 = FYE.
+    """
+    if fiscal_quarter not in range(1, 5):
+        raise ValueError(f"fiscal_quarter must be 1–4, got {fiscal_quarter}")
+    if fye_month not in range(1, 13):
+        raise ValueError(f"fye_month must be 1–12, got {fye_month}")
+    offset = fiscal_quarter * 3  # Q1→3 … Q4→12
+    return ((fye_month - 1 + offset) % 12) + 1
+
+
+def expected_quarter_end_year(
+    *,
+    fiscal_year: int,
+    fye_month: int,
+    expected_end_month: int,
+) -> int:
+    """Calendar year of the expected quarter-end month for a fiscal year label.
+
+    Example (Apple FYE September, FY2025 Q1 → December): end year is 2024.
+    """
+    if expected_end_month > fye_month:
+        return fiscal_year - 1
+    return fiscal_year
+
+
+def quarter_period_months(
+    *,
+    fiscal_year: int,
+    fiscal_quarter: int,
+    fye_month: int,
+) -> dict[str, object]:
+    """Describe the calculated calendar span for a fiscal quarter.
+
+    Returns expected end month/year plus the three ``YYYY-MM`` months in the
+    quarter (inclusive of the end month).
+    """
+    end_month = quarter_end_month(fye_month, fiscal_quarter)
+    end_year = expected_quarter_end_year(
+        fiscal_year=fiscal_year,
+        fye_month=fye_month,
+        expected_end_month=end_month,
+    )
+    months: list[str] = []
+    year, month = end_year, end_month
+    for _ in range(3):
+        months.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month < 1:
+            month = 12
+            year -= 1
+    months.reverse()
+    return {
+        "label": f"FY{fiscal_year} Q{fiscal_quarter}",
+        "expected_end_month": end_month,
+        "expected_end_year": end_year,
+        "months": months,
+    }
+
+
+def fiscal_year_for_report(report: date, fye_month: int) -> int:
+    """Map a period-end ``reportDate`` to the issuer's fiscal year label.
+
+    SEC fiscal years are named by the calendar year of the fiscal year-end.
+    Example (Apple FYE September): Dec 2024 → FY2025; Jun 2025 → FY2025.
+    """
+    if report.month > fye_month:
+        return report.year + 1
+    return report.year
+
+
+def _score_report_match(
+    report: date,
+    *,
+    fye_month: int,
+    fiscal_year: int,
+    fiscal_quarter: int,
+) -> int | None:
+    """Return a lower-is-better score when ``report`` matches year+quarter.
+
+    Allows ±1 calendar month around the expected quarter-end month (Apple
+    often ends late December rather than exactly month-end).
+    """
+    if fiscal_year_for_report(report, fye_month) != fiscal_year:
+        return None
+    expected_month = quarter_end_month(fye_month, fiscal_quarter)
+    # Circular month distance (e.g. Dec↔Jan = 1)
+    delta = min(
+        abs(report.month - expected_month),
+        12 - abs(report.month - expected_month),
+    )
+    if delta > 1:
+        return None
+    # Prefer exact month, then closer day-of-month to month end (~28–31)
+    return delta * 100 + abs(report.day - 28)
 
 
 def find_filing(
@@ -126,45 +241,69 @@ def find_filing(
     *,
     form: str,
     fiscal_year: int,
-) -> dict[str, str]:
-    """Find the best matching filing for ticker/form/fiscal_year.
+    fiscal_quarter: int = 4,
+) -> dict[str, Any]:
+    """Find the filing for ticker/form/fiscal year **and** quarter.
 
-    Matching heuristic: reportDate year == fiscal_year (works for calendar
-    and near-calendar fiscal years; NVDA FY2025 10-K has reportDate in early 2025).
-    Falls back to the most recent filing of that form if year filter misses.
+    Uses SEC submissions ``fiscalYearEnd`` to map ``reportDate`` → fiscal
+    year and expected quarter-end month. Picks the best-scoring match among
+    recent filings of the requested form. Also returns ``fiscal_year_end`` and
+    a calculated ``quarter_period`` for downstream metadata.
     """
     cik = resolve_cik(ticker)
     submissions = _get(SUBMISSIONS_URL.format(cik=cik)).json()
     filings = _filing_list(submissions)
     form_u = form.upper()
+    fye_month = _parse_fye_month(submissions.get("fiscalYearEnd"))
 
     candidates = [f for f in filings if f["form"].upper() == form_u]
     if not candidates:
         raise FileNotFoundError(f"No {form} filings found for {ticker}")
 
-    year_hits = [
-        f
-        for f in candidates
-        if _year_from_report_date(f["reportDate"]) == fiscal_year
-    ]
-    if not year_hits:
-        year_hits = [
-            f
-            for f in candidates
-            if _year_from_report_date(f["filingDate"]) == fiscal_year
-            or _year_from_report_date(f["filingDate"]) == fiscal_year + 1
-        ]
+    scored: list[tuple[int, dict[str, str]]] = []
+    for filing in candidates:
+        report = _parse_iso_date(filing["reportDate"])
+        if report is None:
+            continue
+        score = _score_report_match(
+            report,
+            fye_month=fye_month,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+        )
+        if score is not None:
+            scored.append((score, filing))
 
-    chosen = year_hits[0] if year_hits else candidates[0]
-    chosen = {**chosen, "cik": cik, "ticker": ticker.upper()}
+    if not scored:
+        raise FileNotFoundError(
+            f"No {form} for {ticker} FY{fiscal_year} Q{fiscal_quarter} "
+            f"(fiscalYearEnd={submissions.get('fiscalYearEnd')!r}). "
+            "Check the fiscal year/quarter or SEC submissions history."
+        )
+
+    scored.sort(key=lambda item: item[0])
+    fye_raw = submissions.get("fiscalYearEnd")
+    period = quarter_period_months(
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        fye_month=fye_month,
+    )
+    chosen = {
+        **scored[0][1],
+        "cik": cik,
+        "ticker": ticker.upper(),
+        "fiscal_year_end": fye_raw,  # SEC MMDD, e.g. "0926"
+        "fiscal_year_end_month": fye_month,
+        "quarter_period": period,
+    }
     return chosen
 
 
-def download_primary_document(filing: dict[str, str], dest: Path) -> Path:
+def download_primary_document(filing: dict[str, Any], dest: Path) -> Path:
     """Download the primary HTML/TXT document and write a sidecar ``.meta.json``."""
     cik_int = str(int(filing["cik"]))
-    accession_nodash = filing["accessionNumber"].replace("-", "")
-    primary = filing["primaryDocument"]
+    accession_nodash = str(filing["accessionNumber"]).replace("-", "")
+    primary = str(filing["primaryDocument"])
     url = f"{ARCHIVES_BASE}/{cik_int}/{accession_nodash}/{primary}"
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -172,14 +311,31 @@ def download_primary_document(filing: dict[str, str], dest: Path) -> Path:
     dest.write_bytes(content)
 
     meta_path = dest.with_suffix(dest.suffix + ".meta.json")
-    meta_path.write_text(json.dumps({**filing, "source_url": url}, indent=2), encoding="utf-8")
+    meta_path.write_text(
+        json.dumps({**filing, "source_url": url}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return dest
 
 
-def filing_filename(ticker: str, form: str, fiscal_year: int) -> str:
-    """Build a stable on-disk filename, e.g. ``AAPL_FY2024_10K.html``."""
+def filing_filename(
+    ticker: str,
+    form: str,
+    fiscal_year: int,
+    fiscal_quarter: int | None = None,
+) -> str:
+    """Build a stable on-disk filename.
+
+    - 10-K: ``AAPL_FY2025_10K.html``
+    - 10-Q: ``AAPL_FY2025_Q1_10Q.html`` (quarter required so Q1–Q3 do not collide)
+    """
     form_slug = re.sub(r"[^A-Za-z0-9]+", "", form.upper())
-    return f"{ticker.upper()}_FY{fiscal_year}_{form_slug}.html"
+    ticker_u = ticker.upper()
+    if form_slug == "10Q":
+        if fiscal_quarter is None:
+            raise ValueError("fiscal_quarter is required for 10-Q filenames")
+        return f"{ticker_u}_FY{fiscal_year}_Q{fiscal_quarter}_{form_slug}.html"
+    return f"{ticker_u}_FY{fiscal_year}_{form_slug}.html"
 
 
 def fetch_filing(
@@ -193,13 +349,20 @@ def fetch_filing(
 ) -> Path:
     """Fetch a filing into ``data/raw/filings/{year}/{TICKER}/`` and return the path."""
     out_dir = filing_dir(ticker, fiscal_year)
-    out_path = out_dir / filing_filename(ticker, form, fiscal_year)
+    out_path = out_dir / filing_filename(
+        ticker, form, fiscal_year, fiscal_quarter=fiscal_quarter
+    )
     if out_path.exists() and not force:
         return out_path
 
-    filing = find_filing(ticker, form=form, fiscal_year=fiscal_year)
+    filing = find_filing(
+        ticker,
+        form=form,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+    )
     filing["fiscal_year"] = str(fiscal_year)
-    filing["fiscal_quarter"] = str(fiscal_quarter)
+    filing["fiscal_quarter"] = f"Q{fiscal_quarter}"
     if company_name:
         filing["company_name"] = company_name
     return download_primary_document(filing, out_path)

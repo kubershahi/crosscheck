@@ -24,22 +24,25 @@ def chunk_output_path(
     *,
     doc_type: str,
     fiscal_year: int,
-    fiscal_quarter: int,
+    fiscal_quarter: int | str,
 ) -> Path:
     """Return e.g. ``data/chunks/2025/AAPL/AAPL_FY2025_Q4_transcript.jsonl``."""
+    from crosscheck.models import as_fiscal_quarter
+
     ticker = ticker.upper()
     # Sanitize doc_type for filenames (10-K → 10-K is fine on Unix/macOS)
     safe = doc_type.replace("/", "-")
-    name = f"{ticker}_FY{fiscal_year}_Q{fiscal_quarter}_{safe}.jsonl"
+    q = as_fiscal_quarter(fiscal_quarter)
+    name = f"{ticker}_FY{fiscal_year}_{q}_{safe}.jsonl"
     return chunks_dir(ticker, fiscal_year) / name
 
 
 def write_chunks_jsonl(chunks: list[Chunk], path: Path) -> Path:
-    """Write one JSON object per line; create parent directories as needed."""
+    """Write one JSON object per line; omit null optional fields."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         for chunk in chunks:
-            fh.write(chunk.model_dump_json())
+            fh.write(chunk.model_dump_json(exclude_none=True))
             fh.write("\n")
     return path
 

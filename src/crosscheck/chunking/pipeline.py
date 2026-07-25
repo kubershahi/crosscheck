@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from crosscheck.chunking.filings import chunk_filing_path
 from crosscheck.chunking.store import chunk_output_path, write_chunks_jsonl
@@ -22,32 +23,106 @@ def resolve_filing_path(
     *,
     form: str,
     fiscal_year: int,
+    fiscal_quarter: int | str,
     path: Path | None = None,
 ) -> Path:
     """Return the expected raw filing HTML path (or an explicit override)."""
+    from crosscheck.models import quarter_number
+
     if path is not None:
         return path
-    return filing_dir(ticker, fiscal_year) / filing_filename(ticker, form, fiscal_year)
+    return filing_dir(ticker, fiscal_year) / filing_filename(
+        ticker, form, fiscal_year, fiscal_quarter=quarter_number(fiscal_quarter)
+    )
 
 
 def resolve_transcript_path(
     ticker: str,
     *,
     fiscal_year: int,
-    fiscal_quarter: int,
+    fiscal_quarter: int | str,
     path: Path | None = None,
 ) -> Path:
     """Locate a cleaned transcript ``.txt`` (prefer exact FY/Qn)."""
+    from crosscheck.models import as_fiscal_quarter
+
     if path is not None:
         return path
     tdir = transcript_dir(ticker, fiscal_year)
-    preferred = tdir / f"FY{fiscal_year}_Q{fiscal_quarter}.txt"
+    q = as_fiscal_quarter(fiscal_quarter)
+    preferred = tdir / f"FY{fiscal_year}_{q}.txt"
     if preferred.exists():
         return preferred
     others = sorted(tdir.glob("*.txt"))
     if others:
         return others[0]
     return preferred
+
+
+def _read_sidecar(path: Path) -> dict[str, Any]:
+    """Load a JSON sidecar if present; return {} on missing/invalid."""
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def filing_meta_path(filing_html: Path) -> Path:
+    """Sidecar next to EDGAR HTML (``*.html.meta.json``)."""
+    return filing_html.with_suffix(filing_html.suffix + ".meta.json")
+
+
+def transcript_meta_path(transcript_txt: Path) -> Path:
+    """Sidecar next to cleaned transcript (``*.meta.json``)."""
+    return transcript_txt.with_suffix(".meta.json")
+
+
+def _as_str_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    out = [str(x) for x in value if x is not None and str(x).strip()]
+    return out or None
+
+
+def enrich_filing_meta(meta: DocumentMeta, filing_path: Path) -> DocumentMeta:
+    """Attach filingDate / reportDate / quarter_period fields from the sidecar."""
+    raw = _read_sidecar(filing_meta_path(filing_path))
+    if not raw:
+        return meta
+    qp = raw.get("quarter_period")
+    qp_dict = qp if isinstance(qp, dict) else {}
+    company = str(raw.get("company_name") or meta.company_name)
+    return meta.model_copy(
+        update={
+            "company_name": company,
+            "filing_date": (str(raw["filingDate"]) if raw.get("filingDate") else None),
+            "report_date": (str(raw["reportDate"]) if raw.get("reportDate") else None),
+            "quarter_period_label": (
+                str(qp_dict["label"]) if qp_dict.get("label") else None
+            ),
+            "quarter_months": _as_str_list(qp_dict.get("months")),
+        }
+    )
+
+
+def enrich_transcript_meta(
+    meta: DocumentMeta, transcript_path: Path
+) -> DocumentMeta:
+    """Attach ``call_date`` (and company_name if present) from the sidecar."""
+    raw = _read_sidecar(transcript_meta_path(transcript_path))
+    if not raw:
+        return meta
+    company = str(raw.get("company_name") or meta.company_name)
+    call_date = raw.get("call_date")
+    return meta.model_copy(
+        update={
+            "company_name": company,
+            "call_date": str(call_date) if call_date else None,
+        }
+    )
 
 
 def build_chunks_for_period(
@@ -61,12 +136,18 @@ def build_chunks_for_period(
 
     Returns chunk lists plus source/output paths.
     """
-    form = period.form or ("10-K" if period.fiscal_quarter == 4 else "10-Q")
+    form = period.form or ("10-K" if period.fiscal_quarter == "Q4" else "10-Q")
     fy = period.fiscal_year
-    fq = period.fiscal_quarter
+    fq = period.fiscal_quarter_num
     ticker = period.ticker
 
-    filing = resolve_filing_path(ticker, form=form, fiscal_year=fy, path=filing_path)
+    filing = resolve_filing_path(
+        ticker,
+        form=form,
+        fiscal_year=fy,
+        fiscal_quarter=fq,
+        path=filing_path,
+    )
     transcript = resolve_transcript_path(
         ticker,
         fiscal_year=fy,
@@ -84,15 +165,18 @@ def build_chunks_for_period(
             f"Run fetch_corpus or drop a .txt under {transcript_dir(ticker, fy)}"
         )
 
-    meta = DocumentMeta(
+    base = DocumentMeta(
         ticker=ticker,
         company_name=period.company_name,
         fiscal_year=fy,
         fiscal_quarter=fq,
         form=form,
     )
-    filing_chunks = chunk_filing_path(filing, meta)
-    transcript_chunks = chunk_transcript_path(transcript, meta)
+    filing_meta = enrich_filing_meta(base, filing)
+    transcript_meta = enrich_transcript_meta(base, transcript)
+
+    filing_chunks = chunk_filing_path(filing, filing_meta)
+    transcript_chunks = chunk_transcript_path(transcript, transcript_meta)
 
     filing_out: Path | None = None
     transcript_out: Path | None = None
@@ -175,20 +259,30 @@ def discover_raw_periods(
                     filings_root
                     / str(fiscal_year)
                     / ticker
-                    / filing_filename(ticker, form, fiscal_year)
+                    / filing_filename(
+                        ticker,
+                        form,
+                        fiscal_year,
+                        fiscal_quarter=fiscal_quarter,
+                    )
                 )
+                # Legacy 10-Q name without quarter (pre Day-3 multi-quarter).
+                if not filing.exists() and form == "10-Q":
+                    legacy = (
+                        filings_root
+                        / str(fiscal_year)
+                        / ticker
+                        / f"{ticker}_FY{fiscal_year}_10Q.html"
+                    )
+                    if legacy.exists():
+                        filing = legacy
                 if not filing.exists():
                     continue
                 company_name = ticker
-                transcript_meta = transcript.with_suffix(".meta.json")
-                if transcript_meta.exists():
-                    try:
-                        raw_meta = json.loads(
-                            transcript_meta.read_text(encoding="utf-8")
-                        )
-                        company_name = str(raw_meta.get("company_name") or ticker)
-                    except (json.JSONDecodeError, OSError):
-                        pass
+                transcript_meta = transcript_meta_path(transcript)
+                raw_meta = _read_sidecar(transcript_meta)
+                if raw_meta.get("company_name"):
+                    company_name = str(raw_meta["company_name"])
                 ticker_periods.append(
                     DocumentMeta(
                         ticker=ticker,
