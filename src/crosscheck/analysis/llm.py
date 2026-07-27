@@ -116,19 +116,10 @@ def complete_structured(
 
     for model_idx, model in enumerate(models, start=1):
         model_unavailable = False
-        print(
-            f"  [llm] ({model_idx}/{len(models)}) trying model={model}",
-            flush=True,
-        )
         for mode in GENAI_MODES:
             mode_name = _mode_label(mode)
             client = _make_genai_client(mode)
             for attempt in range(max_retries):
-                print(
-                    f"  [llm]   → mode={mode_name} attempt={attempt + 1}/{max_retries} "
-                    f"waiting for response (≤{_HTTP_TIMEOUT_MS // 1000}s) …",
-                    flush=True,
-                )
                 try:
                     result = client.chat.completions.create(
                         model=model,
@@ -136,61 +127,44 @@ def complete_structured(
                         messages=messages,
                         max_retries=0,
                     )
-                    if model != primary:
-                        print(
-                            f"  [llm] ok via fallback model={model} mode={mode_name}",
-                            flush=True,
-                        )
-                    else:
+                    if model != primary or mode_name != _mode_label(GENAI_MODES[0]):
                         print(
                             f"  [llm] ok model={model} mode={mode_name}",
                             flush=True,
                         )
+                    else:
+                        print(f"  [llm] ok model={model}", flush=True)
                     return result, model
                 except (ValidationError, ValueError) as exc:
                     last_exc = exc
                     print(
-                        f"  [llm]   ✗ parse/validation: {_exc_preview(exc)}",
+                        f"  [llm] parse error model={model} mode={mode_name}: "
+                        f"{_exc_preview(exc)}",
                         flush=True,
                     )
                     if attempt + 1 < max_retries:
-                        print("  [llm]   retrying same mode …", flush=True)
                         continue
                     break
                 except Exception as exc:
                     last_exc = exc
-                    print(
-                        f"  [llm]   ✗ {_exc_preview(exc)}",
-                        flush=True,
-                    )
                     if _is_model_unavailable(exc):
                         print(
-                            "  [llm]   model unavailable, skipping remaining modes",
+                            f"  [llm] unavailable model={model}; trying next",
                             flush=True,
                         )
                         model_unavailable = True
                         break
                     if _is_mode_error(exc):
-                        print(
-                            "  [llm]   mode unsupported, trying next mode …",
-                            flush=True,
-                        )
                         break
                     if _is_retryable(exc) and attempt + 1 < max_retries:
-                        print("  [llm]   retryable error, retrying …", flush=True)
                         continue
                     if _is_retryable(exc) or _is_mode_error(exc):
                         break
+                    print(f"  [llm] error: {_exc_preview(exc)}", flush=True)
                     raise
             if model_unavailable:
                 break
 
-        if model != models[-1]:
-            print(
-                f"  [llm] {model} failed, trying next ranked model …",
-                flush=True,
-            )
-
     assert last_exc is not None
-    print(f"  [llm] all models failed; last error: {_exc_preview(last_exc)}", flush=True)
+    print(f"  [llm] all models failed: {_exc_preview(last_exc)}", flush=True)
     raise last_exc

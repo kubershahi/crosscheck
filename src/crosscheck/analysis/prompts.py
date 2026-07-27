@@ -5,29 +5,43 @@ from __future__ import annotations
 CLAIM_EXTRACTION_SYSTEM = """\
 You are a financial analyst extracting testable assertions from earnings call transcripts.
 
-You receive the full cleaned earnings-call transcript. Extract atomic, verifiable \
-financial claims that could be checked against the same-period SEC 10-Q or 10-K filing.
+You receive the full cleaned earnings-call transcript. Extract atomic claims that \
+could later be checked against the same-period SEC filing or assessed as company \
+statements of record from the call.
 
-Prioritize (reported results for the quarter just discussed):
-- Revenue, earnings, EPS, margins, and segment performance for the current / reported quarter
-- Year-over-year or quarter-over-quarter changes with numbers when stated for that quarter
-- Balance sheet, cash flow, or other metrics presented as actual results for the period
+Diversity (important):
+- Do NOT default to the same template every time (total revenue + EPS + Services).
+- Across the set you return, deliberately vary claim types. Mix from different \
+buckets when the transcript supports it, for example:
+  • Headline results (revenue, EPS, net income) — at most one unless the set is small
+  • Product / segment / geographic results (iPhone, Services, Cloud, region, etc.)
+  • Margins, gross profit, operating income, or expense lines stated as actuals
+  • Cash, liquidity, capital return (buybacks, dividends) stated as actuals
+  • Concrete decisions or outcomes executives described as already done or already \
+paying off this period (launches that contributed, pricing actions that worked, \
+cost actions completed, customer wins cited with figures)
+  • Strategy or positioning claims only when tied to a specific, checkable fact \
+from the call (not vague slogans)
+- Prefer a varied set over three near-duplicate top-line metrics.
+- If many strong candidates exist, pick a diverse sample rather than the first \
+three headline numbers in prepared remarks.
 
-Deprioritize / avoid (forward-looking):
-- Next-quarter guidance, outlook, or expected ranges
-- Full-year forecasts, CapEx plans, expense guidance, or other forward targets
-- Speculative commentary about future demand, investment levels, or "we expect / we anticipate"
+Deprioritize only (forward-looking):
+- Next-quarter or full-year guidance, outlook ranges, "we expect / we anticipate"
+- CapEx / hiring / investment plans framed as future intent
+- Speculative future demand without a reported-period anchor
+
+Still allowed: past-tense or present-result language about the quarter just reported, \
+including non-GAAP figures if stated as results for that period.
 
 Rules:
-- Each claim must be a single, self-contained sentence
-- Attribute each claim to the speaker who made it (use the name on the speaker line)
-- Prefer statements from company executives (CEO, CFO, and other company speakers)
-- Skip analyst questions, operator prompts, IR logistics, and non-financial chatter
-- Prefer claims with specific numbers, percentages, or time periods tied to reported results
-- Prefer earlier company prepared commentary, but include later answers when they contain \
-strong numeric assertions about the reported quarter
-- If you must choose among candidates, always prefer current-quarter actuals over guidance
+- Each claim is one self-contained sentence with enough context to stand alone
+- Attribute the speaker from the speaker line (prefer company executives)
+- Skip analyst questions, operator prompts, IR logistics, and pure chatter
+- Prefer claims with numbers, percentages, or named products/segments when available
+- Include Q&A answers when they add distinct facts not already covered
 """
+
 
 NLI_SYSTEM = """\
 Classify a transcript claim against SEC filing passages as Consistent, Contradictory, \
@@ -44,6 +58,10 @@ Contradictory only for clear conflicts (wrong direction, incompatible magnitude)
 Unverifiable if the needed figures are missing.
 
 Set classification last so it matches your reasoning. Use only the passages given.
+
+Also set matched_passage_index to the 1-based Passage N that best supports or \
+contradicts the claim (the evidence you relied on). Use 0 only if none of the \
+passages are usable for the decision (typical for Unverifiable).
 """
 
 
@@ -56,8 +74,17 @@ Full earnings-call transcript:
 {transcript_text}
 ---
 
-Extract up to {max_claims} testable financial claims about the reported quarter's \
-actual results. Do not select next-quarter or full-year forward-looking guidance."""
+Extract up to {max_claims} diverse, testable claims from this call.
+
+Requirements:
+- Vary topics across the set (do not return only total revenue, EPS, and Services \
+every time).
+- Include a mix of quantitative results and, when available, distinct segment/product \
+metrics or concrete decisions/outcomes described for the reported period.
+- Deprioritize forward-looking guidance only; everything else about reported results \
+or stated period outcomes is fair game.
+- Each claim: one sentence, with speaker attribution.
+"""
 
 
 def nli_user(
@@ -106,5 +133,6 @@ Filing passages:
 {filing_block}
 ---
 
-Return classification, confidence_score (0–1), and brief reasoning.
+Return classification, confidence_score (0–1), brief reasoning, and \
+matched_passage_index (1-based Passage number relied on, or 0 if none).
 """

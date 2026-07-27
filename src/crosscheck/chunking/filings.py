@@ -75,6 +75,58 @@ def _normalize_ws(text: str) -> str:
     return text.strip()
 
 
+_PUNCT_NO_SPACE_BEFORE = set(".,;:)]}%")
+_PUNCT_NO_SPACE_AFTER = set("([{$")
+
+
+def _element_text(node: Tag) -> str:
+    """Extract visible text without inventing mid-word spaces.
+
+    BeautifulSoup ``get_text(" ", strip=True)`` always inserts a space between
+    text nodes. MSFT (and similar) filings split titles mid-word across adjacent
+    ``<span>``s with no whitespace in the HTML, which becomes
+    ``INCOME STA TEMENTS``.
+
+    Join with a space when either adjacent node carried whitespace (including
+    trailing space on the previous node, e.g. ``BALANCE `` + ``SHEETS``). Only
+    concatenate when letter/digit runs sit flush with no whitespace in source.
+    """
+    parts: list[str] = []
+    prev_had_trailing_ws = False
+    for s in node.strings:
+        raw = str(s).replace("\xa0", " ")
+        if not raw.strip():
+            if parts and not parts[-1].endswith(" "):
+                parts.append(" ")
+            prev_had_trailing_ws = True
+            continue
+        token = raw.strip()
+        had_leading_ws = raw[0].isspace()
+        had_trailing_ws = raw[-1].isspace()
+        if not parts:
+            parts.append(token)
+            prev_had_trailing_ws = had_trailing_ws
+            continue
+        prev = parts[-1]
+        if had_leading_ws or prev_had_trailing_ws or prev.endswith(" "):
+            if not prev.endswith(" "):
+                parts.append(" ")
+            parts.append(token)
+        elif prev[-1].isalnum() and token[0].isalnum():
+            # Flush mid-word span split (e.g. "STA" + "TEMENTS").
+            parts.append(token)
+        else:
+            if (
+                not prev.endswith(" ")
+                and prev[-1] not in _PUNCT_NO_SPACE_AFTER
+                and token[0] not in _PUNCT_NO_SPACE_BEFORE
+            ):
+                parts.append(" ")
+            parts.append(token)
+        prev_had_trailing_ws = had_trailing_ws
+    return _normalize_ws("".join(parts))
+
+
 def _style_align(style: str | None, align_attr: str | None = None) -> str | None:
     """Parse CSS ``text-align`` or HTML ``align`` into a lowercase token."""
     if style:
@@ -168,7 +220,7 @@ def _table_to_markdown(table: Tag) -> str:
     grid: list[list[str]] = []
     for tr in table.find_all("tr"):
         cells = [
-            _normalize_ws(cell.get_text(" ", strip=True))
+            _element_text(cell)
             for cell in tr.find_all(["th", "td"])
         ]
         if any(cells):
@@ -229,7 +281,7 @@ def _iter_blocks(soup: BeautifulSoup) -> list[Block]:
             return
 
         if name in _BLOCK_TAGS or name in {"font"}:
-            text = _normalize_ws(node.get_text(" ", strip=True))
+            text = _element_text(node)
             if text:
                 blocks.append(
                     Block(

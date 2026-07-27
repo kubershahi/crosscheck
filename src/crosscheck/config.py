@@ -6,17 +6,21 @@ Layout (year-first)::
     data/raw/transcripts/{fiscal_year}/{TICKER}/
     data/chunks/{fiscal_year}/{TICKER}/          # per-company JSONL (stateless)
     data/claims/{fiscal_year}/{TICKER}/
-    data/indices/filings/                        # 10-K / 10-Q only (NLI retrieval)
+    data/indices/filings/                        # merge + dense embed scratch for Qdrant
       all_chunks.jsonl
       embeddings.npy
-      index.faiss
       manifest.json
-    data/indices/transcripts/                    # transcript corpus (separate)
+    data/indices/transcripts/                    # merge + dense embed scratch for Qdrant
       all_chunks.jsonl
       embeddings.npy
-      index.faiss
       manifest.json
+    data/indices/qdrant/                         # local Qdrant path fallback
     data/reports/{fiscal_year}/{TICKER}/
+    data/runs/                                   # NLI run summary CSVs (run_<timestamp>.csv)
+    data/eval/                                   # golden-set candidates (candidates.jsonl)
+
+Filings and transcripts NLI/retrieval use Qdrant Cloud (or local path) hybrid
+dense+BM25+RRF. Set ``QDRANT_ENDPOINT`` + ``QDRANT_API_KEY`` in ``.env``.
 
 Company periods to fetch come from ``data/manifests/companies.yml``. Downstream
 stages discover inputs from ``data/raw``, ``data/chunks``, and ``data/claims``.
@@ -39,6 +43,8 @@ CHUNKS_DIR = DATA_DIR / "chunks"
 CLAIMS_DIR = DATA_DIR / "claims"
 INDICES_DIR = DATA_DIR / "indices"
 REPORTS_DIR = DATA_DIR / "reports"
+RUNS_DIR = DATA_DIR / "runs"
+EVAL_DIR = DATA_DIR / "eval"
 MANIFESTS_DIR = DATA_DIR / "manifests"
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -113,13 +119,49 @@ def indices_dir(ticker: str, fiscal_year: int) -> Path:
 
 
 def filings_index_path() -> Path:
-    """Return ``data/indices/filings/index.faiss``."""
+    """Deprecated FAISS path; filings dense search uses Qdrant (see qdrant helpers)."""
     return INDICES_DIR / "filings" / "index.faiss"
 
 
 def transcripts_index_path() -> Path:
     """Return ``data/indices/transcripts/index.faiss``."""
     return INDICES_DIR / "transcripts" / "index.faiss"
+
+
+def get_qdrant_endpoint() -> str | None:
+    """Return Qdrant Cloud cluster URL, or None for local path mode."""
+    for name in ("QDRANT_ENDPOINT", "QDRANT_URL"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def get_qdrant_api_key() -> str | None:
+    """Return Qdrant API key when using Cloud / secured server."""
+    key = os.getenv("QDRANT_API_KEY", "").strip()
+    return key or None
+
+
+def get_qdrant_path() -> Path:
+    """Local embedded Qdrant path when ``QDRANT_ENDPOINT`` is unset."""
+    raw = os.getenv("QDRANT_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return INDICES_DIR / "qdrant"
+
+
+def get_qdrant_filings_collection() -> str:
+    """Qdrant collection name for filing chunks."""
+    return os.getenv("QDRANT_FILINGS_COLLECTION", "filings").strip() or "filings"
+
+
+def get_qdrant_transcripts_collection() -> str:
+    """Qdrant collection name for transcript chunks."""
+    return (
+        os.getenv("QDRANT_TRANSCRIPTS_COLLECTION", "transcripts").strip()
+        or "transcripts"
+    )
 
 
 def unified_master_index_path() -> Path:

@@ -7,11 +7,21 @@ filtering). Chunk JSONL is used only to discover company-periods.
 Examples::
 
     # Every transcript period discovered under data/chunks
-    python scripts/extract_claims.py --n 3
+    python scripts/extract_claims.py --n 5
 
-    # One ticker or a comma-separated subset
-    python scripts/extract_claims.py --ticker AAPL --n 3
-    python scripts/extract_claims.py --ticker AAPL,MSFT --n 3 --force
+    # By ticker
+    python scripts/extract_claims.py --ticker AAPL --n 5
+    python scripts/extract_claims.py --ticker AAPL,MSFT --n 5
+
+    # By year / quarter (alone or combined)
+    python scripts/extract_claims.py --year 2025 --n 5
+    python scripts/extract_claims.py --quarter Q2 --n 5
+    python scripts/extract_claims.py --year 2025 --quarter Q1 --n 5
+    python scripts/extract_claims.py --ticker AAPL --year 2025 --quarter Q3 --n 5
+
+    # Replace claims that already exist
+    python scripts/extract_claims.py --force --n 5
+    python scripts/extract_claims.py --ticker AAPL --year 2025 --quarter Q2 --force --n 5
 
 Prerequisite: run ``python scripts/fetch_corpus.py`` (and ideally
 ``python scripts/build_chunks.py`` so periods are discoverable).
@@ -31,7 +41,7 @@ from crosscheck.analysis.claims import extract_claims, save_claims  # noqa: E402
 from crosscheck.chunking.pipeline import resolve_transcript_path  # noqa: E402
 from crosscheck.chunking.store import iter_company_chunk_files, load_chunks_jsonl  # noqa: E402
 from crosscheck.config import claims_path, get_llm_profile, resolve_llm_models  # noqa: E402
-from crosscheck.models import Chunk, DocumentMeta  # noqa: E402
+from crosscheck.models import Chunk, DocumentMeta, as_fiscal_quarter  # noqa: E402
 
 
 def _parse_tickers(value: str | None) -> set[str] | None:
@@ -71,12 +81,25 @@ def main() -> None:
         help="Optional ticker or comma-separated subset (e.g. AAPL,MSFT).",
     )
     parser.add_argument(
+        "--year",
+        type=int,
+        action="append",
+        dest="years",
+        help="Filter to fiscal year(s); repeatable (e.g. --year 2025).",
+    )
+    parser.add_argument(
+        "--quarter",
+        action="append",
+        dest="quarters",
+        help="Filter to fiscal quarter(s); repeatable (Q1–Q4 or 1–4).",
+    )
+    parser.add_argument(
         "--n",
         type=int,
-        default=3,
-        choices=range(1, 5),
-        metavar="1-4",
-        help="Maximum claims per company (default: 3).",
+        default=5,
+        choices=range(1, 11),
+        metavar="1-10",
+        help="Maximum claims per company-period (default: 5).",
     )
     parser.add_argument(
         "--force",
@@ -98,6 +121,14 @@ def main() -> None:
     if args.ticker is not None and not wanted:
         parser.error("--ticker must contain at least one ticker")
 
+    year_set = set(args.years) if args.years else None
+    quarter_set: set[str] | None = None
+    if args.quarters:
+        try:
+            quarter_set = {as_fiscal_quarter(q) for q in args.quarters}
+        except ValueError as exc:
+            parser.error(str(exc))
+
     transcript_files = [
         path
         for path in iter_company_chunk_files()
@@ -111,12 +142,13 @@ def main() -> None:
     models = resolve_llm_models()
     print(
         f"Claim extraction: profile={get_llm_profile()} "
-        f"max_claims={args.n} files={len(transcript_files)}",
+        f"max_claims={args.n} candidates={len(transcript_files)}",
         flush=True,
     )
     print(f"  model rank: {' → '.join(models)}", flush=True)
 
-    for file_idx, transcript_path in enumerate(transcript_files, start=1):
+    file_idx = 0
+    for transcript_path in transcript_files:
         chunks = load_chunks_jsonl(transcript_path)
         if not chunks:
             print(f"\n[skip] empty transcript chunks: {transcript_path}", flush=True)
@@ -128,6 +160,11 @@ def main() -> None:
                 flush=True,
             )
             continue
+        if year_set is not None and first.fiscal_year not in year_set:
+            continue
+        if quarter_set is not None and as_fiscal_quarter(first.fiscal_period) not in quarter_set:
+            continue
+
         period = DocumentMeta(
             ticker=first.ticker,
             company_name=first.company_name or first.ticker,
@@ -140,10 +177,8 @@ def main() -> None:
             period.fiscal_year,
             period.fiscal_quarter,
         )
-        print(
-            f"\n[{file_idx}/{len(transcript_files)}] {label}",
-            flush=True,
-        )
+        file_idx += 1
+        print(f"\n[{file_idx}] {label}", flush=True)
 
         if out.exists() and not args.force:
             print(f"  skip: claims already exist at {out}", flush=True)
@@ -170,6 +205,10 @@ def main() -> None:
             f"  wrote {len(saved.claims)} claims via {model}: {out}",
             flush=True,
         )
+
+    if file_idx == 0:
+        print("No periods matched --ticker / --year / --quarter filters.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

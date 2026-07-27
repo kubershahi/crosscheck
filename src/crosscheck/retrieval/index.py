@@ -1,7 +1,7 @@
-"""Disk-streamed corpus assembly, embeddings, and FAISS indexing.
+"""Disk-streamed corpus assembly, embeddings, and Qdrant hybrid indexing.
 
-Filings (10-K / 10-Q) and transcripts are indexed separately so NLI retrieves
-only SEC filing passages when checking transcript claims.
+Filings (10-K / 10-Q) and transcripts are indexed in separate Qdrant collections
+so NLI can retrieve only SEC filing passages when checking transcript claims.
 """
 
 from __future__ import annotations
@@ -53,13 +53,18 @@ CORPUS_DOC_TYPES: dict[CorpusKind, frozenset[str]] = {
 
 @dataclass
 class CorpusIndex:
-    """FAISS index + aligned ``IndexedChunk`` rows (global_id == row)."""
+    """Loaded corpus for retrieval.
+
+    Filings (Qdrant hybrid): ``index`` is None; dense+BM25+RRF run in Qdrant.
+    Transcripts (FAISS): ``index`` is IndexFlatIP; optional local BM25 unused by NLI.
+    """
 
     corpus: CorpusKind
-    index: faiss.IndexFlatIP
     chunks: list[IndexedChunk]
     embedding_model: str
+    index: faiss.IndexFlatIP | None = None
     bm25: Bm25Index | None = None
+    backend: Literal["qdrant", "faiss"] = "faiss"
 
 
 # Backward-compatible alias used by older call sites.
@@ -97,13 +102,10 @@ def filings_index_path() -> Path:
 
 
 def corpus_index_exists(corpus: CorpusKind) -> bool:
-    """True when all artifacts for one corpus exist."""
-    return (
-        corpus_index_path(corpus).exists()
-        and corpus_chunks_path(corpus).exists()
-        and corpus_embeddings_path(corpus).exists()
-        and corpus_manifest_path(corpus).exists()
-    )
+    """True when merge manifest + Qdrant collection exist for ``corpus``."""
+    from crosscheck.retrieval.qdrant_store import collection_ready
+
+    return corpus_manifest_path(corpus).exists() and collection_ready(corpus)
 
 
 def count_jsonl_rows(path: Path) -> int:
@@ -326,9 +328,9 @@ def build_corpus_index(
     force: bool = False,
     batch_size: int = 16,
 ) -> Path:
-    """Merge → contextual embed → write FAISS for one corpus."""
+    """Merge → contextual embed → Qdrant hybrid (filings or transcripts)."""
     if corpus_index_exists(corpus) and not force:
-        return corpus_index_path(corpus)
+        return corpus_manifest_path(corpus)
 
     print(f"[build_indices] assembling {corpus} index …", flush=True)
     chunks_path = merge_corpus_chunks(corpus, force=True)
@@ -340,14 +342,38 @@ def build_corpus_index(
         batch_size=batch_size,
         progress_desc=f"Embed {corpus}",
     )
-    path = build_faiss_from_memmap(
-        source_path=disk_embeddings_path,
-        output_path=corpus_index_path(corpus),
-        total_chunks=total_chunks,
-    )
 
+    from crosscheck.config import (
+        get_qdrant_endpoint,
+        get_qdrant_filings_collection,
+        get_qdrant_transcripts_collection,
+    )
+    from crosscheck.retrieval.qdrant_store import upsert_corpus_from_memmap
+
+    collection = (
+        get_qdrant_filings_collection()
+        if corpus == "filings"
+        else get_qdrant_transcripts_collection()
+    )
+    endpoint = get_qdrant_endpoint()
+    target = endpoint or "local QDRANT_PATH"
+    print(
+        f"  [{corpus}] upserting {total_chunks} points to Qdrant "
+        f"({target}, collection={collection!r}) …",
+        flush=True,
+    )
+    upsert_corpus_from_memmap(
+        corpus,
+        chunks_path,
+        disk_embeddings_path,
+        n_chunks=total_chunks,
+        batch_size=max(batch_size, 32),
+        force=True,
+    )
+    path = corpus_manifest_path(corpus)
     manifest = {
         "corpus": corpus,
+        "backend": "qdrant",
         "doc_types": sorted(CORPUS_DOC_TYPES[corpus]),
         "embedding_model": EMBEDDING_MODEL,
         "embedding_dimension": EMBEDDING_DIMENSION,
@@ -356,15 +382,16 @@ def build_corpus_index(
         "n_chunks": total_chunks,
         "all_chunks_path": str(chunks_path),
         "embeddings_path": str(disk_embeddings_path),
-        "index_path": str(path),
-        "index_type": "IndexFlatIP",
+        "qdrant_endpoint": endpoint,
+        "qdrant_collection": collection,
+        "index_type": "qdrant_hybrid_dense_bm25_rrf",
         "embedding_batch_size": batch_size,
     }
-    corpus_manifest_path(corpus).write_text(
-        json.dumps(manifest, indent=2) + "\n",
-        encoding="utf-8",
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"  [{corpus}] Qdrant hybrid ready ({total_chunks} points)",
+        flush=True,
     )
-    print(f"  [{corpus}] wrote {path} ({total_chunks} vectors)", flush=True)
     return path
 
 
@@ -381,7 +408,7 @@ def build_all_indices(
     outs: dict[CorpusKind, Path] = {}
     for corpus in selected:
         if corpus_index_exists(corpus) and not force:
-            path = corpus_index_path(corpus)
+            path = corpus_manifest_path(corpus)
             print(f"skip: {corpus} index exists at {path} (use --force)", flush=True)
             outs[corpus] = path
             continue
@@ -395,34 +422,68 @@ def build_all_indices(
 
 
 def load_corpus_index(corpus: CorpusKind) -> CorpusIndex:
-    """Load FAISS + aligned master JSONL for one corpus."""
-    if not corpus_index_exists(corpus):
-        raise FileNotFoundError(
-            f"{corpus} index missing. Run: python scripts/build_indices.py "
-            f"--corpus {corpus}\n"
-            f"  expected {corpus_index_path(corpus)}"
-        )
-    chunks = load_indexed_chunks_jsonl(corpus_chunks_path(corpus))
-    index = faiss.read_index(str(corpus_index_path(corpus)))
-    if index.ntotal != len(chunks):
-        raise RuntimeError(
-            f"FAISS ntotal={index.ntotal} != {corpus} all_chunks lines={len(chunks)}. "
-            "Rebuild with --force."
-        )
-    manifest = json.loads(corpus_manifest_path(corpus).read_text(encoding="utf-8"))
-    bm25 = build_bm25_index(chunks) if corpus == "filings" else None
-    return CorpusIndex(
-        corpus=corpus,
-        index=index,
-        chunks=chunks,
-        embedding_model=manifest.get("embedding_model", EMBEDDING_MODEL),
-        bm25=bm25,
-    )
+    """Load corpus for retrieval (Qdrant hybrid for filings or transcripts)."""
+    if corpus == "filings":
+        return load_filings_index()
+    return load_transcripts_index()
 
 
 def load_filings_index() -> CorpusIndex:
-    """Load the filings-only index used by NLI (includes in-memory BM25)."""
-    return load_corpus_index("filings")
+    """Load filings corpus backed by Qdrant hybrid search.
+
+    Does not load ``all_chunks.jsonl`` — hybrid hits carry full payloads from
+    Qdrant. ``chunks`` stays empty on this path.
+    """
+    from crosscheck.retrieval.qdrant_store import collection_ready
+
+    manifest_path = corpus_manifest_path("filings")
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            "Filings index missing. Run: python scripts/build_indices.py "
+            "--corpus filings --force\n"
+            f"  expected {manifest_path}"
+        )
+    if not collection_ready("filings"):
+        raise FileNotFoundError(
+            "Qdrant filings collection empty or missing. "
+            "Run: python scripts/build_indices.py --corpus filings --force"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return CorpusIndex(
+        corpus="filings",
+        index=None,
+        chunks=[],
+        embedding_model=manifest.get("embedding_model", EMBEDDING_MODEL),
+        bm25=None,
+        backend="qdrant",
+    )
+
+
+def load_transcripts_index() -> CorpusIndex:
+    """Load transcripts corpus backed by Qdrant hybrid search."""
+    from crosscheck.retrieval.qdrant_store import collection_ready
+
+    manifest_path = corpus_manifest_path("transcripts")
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            "Transcripts index missing. Run: python scripts/build_indices.py "
+            "--corpus transcripts --force\n"
+            f"  expected {manifest_path}"
+        )
+    if not collection_ready("transcripts"):
+        raise FileNotFoundError(
+            "Qdrant transcripts collection empty or missing. "
+            "Run: python scripts/build_indices.py --corpus transcripts --force"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return CorpusIndex(
+        corpus="transcripts",
+        index=None,
+        chunks=[],
+        embedding_model=manifest.get("embedding_model", EMBEDDING_MODEL),
+        bm25=None,
+        backend="qdrant",
+    )
 
 
 def load_master_index() -> CorpusIndex:
@@ -442,8 +503,21 @@ def retrieve(
     fiscal_quarter: str | None = None,
     candidate_multiplier: int = 20,
 ) -> list[tuple[IndexedChunk, float]]:
-    """Embed a query and return top-k chunks, optionally filtered by metadata."""
-    if not master.chunks or master.index.ntotal == 0:
+    """Dense retrieve (FAISS) or hybrid Qdrant when ``backend=qdrant``."""
+    if master.backend == "qdrant":
+        return hybrid_retrieve(
+            query,
+            master,
+            model,
+            k=k,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            doc_types=doc_types,
+            candidate_multiplier=candidate_multiplier,
+        )
+
+    if not master.chunks or master.index is None or master.index.ntotal == 0:
         return []
 
     search_k = min(master.index.ntotal, max(k * candidate_multiplier, k))
@@ -483,26 +557,54 @@ def hybrid_retrieve(
     candidate_multiplier: int = 20,
     rrf_k: int = 60,
 ) -> list[tuple[IndexedChunk, float]]:
-    """Dense FAISS + BM25, each filtered, then RRF-fuse to top-k.
-
-    Each channel overfetches ``max(k, 20)`` (or denser FAISS overfetch via
-    ``candidate_multiplier``), then RRF merges the filtered ranked lists.
-    """
+    """Hybrid retrieve: Qdrant dense+BM25+RRF (filings or transcripts)."""
     if k < 1:
         return []
 
+    if corpus.backend == "qdrant":
+        from crosscheck.retrieval.qdrant_store import hybrid_search
+
+        query_vec = embed_texts(model, [query.strip()])[0]
+        return hybrid_search(
+            query,
+            query_vec,
+            k=k,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            doc_types=doc_types,
+            prefetch_k=max(k, 20),
+            corpus=corpus.corpus,
+        )
+
     channel_k = max(k, 20)
-    dense = retrieve(
-        query,
-        corpus,
-        model,
-        k=channel_k,
-        ticker=ticker,
-        doc_types=doc_types,
-        fiscal_year=fiscal_year,
-        fiscal_quarter=fiscal_quarter,
-        candidate_multiplier=candidate_multiplier,
-    )
+    # Avoid recurse through retrieve() qdrant branch
+    if not corpus.chunks or corpus.index is None or corpus.index.ntotal == 0:
+        dense: list[tuple[IndexedChunk, float]] = []
+    else:
+        search_k = min(
+            corpus.index.ntotal,
+            max(channel_k * candidate_multiplier, channel_k),
+        )
+        query_vec = embed_texts(model, [query.strip()])
+        scores, indices = corpus.index.search(query_vec, search_k)
+        ticker_u = ticker.upper() if ticker else None
+        dense = []
+        for idx, score in zip(indices[0], scores[0], strict=True):
+            if idx < 0:
+                continue
+            chunk = corpus.chunks[int(idx)]
+            if ticker_u and chunk.ticker != ticker_u:
+                continue
+            if doc_types and chunk.doc_type not in doc_types:
+                continue
+            if fiscal_year is not None and chunk.fiscal_year != fiscal_year:
+                continue
+            if not period_matches(chunk.fiscal_period, fiscal_quarter):
+                continue
+            dense.append((chunk, float(score)))
+            if len(dense) >= channel_k:
+                break
 
     sparse: list[tuple[IndexedChunk, float]] = []
     if corpus.bm25 is not None:

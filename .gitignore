@@ -229,6 +229,10 @@ data/indices/**
 !data/indices/.gitkeep
 data/reports/**
 !data/reports/.gitkeep
+data/runs/**
+!data/runs/.gitkeep
+data/eval/**
+!data/eval/.gitkeep
 !data/raw/.gitkeep
 !data/manifests/
 !data/manifests/**

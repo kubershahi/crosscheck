@@ -9,13 +9,9 @@ from crosscheck.models import (
     ContradictionFinding,
     DocumentMeta,
     FinancialClaim,
+    IndexedChunk,
     NLIJudgment,
 )
-
-
-def _passage_section_label(chunk: Chunk) -> str:
-    """Item/PART section label used in report ``source_sections``."""
-    return chunk.section or "Unknown"
 
 
 def _passage_for_nli(chunk: Chunk) -> dict[str, str | None]:
@@ -38,8 +34,13 @@ def classify_claim(
     retrieved: list[tuple[Chunk, float]],
     *,
     period: DocumentMeta,
-) -> tuple[ContradictionFinding, str]:
-    """Classify one claim against retrieved filing chunks; return (finding, model_used)."""
+) -> tuple[ContradictionFinding, str, int]:
+    """Classify one claim against retrieved filing chunks.
+
+    Returns ``(finding, model_used, matched_passage_index)`` where
+    ``matched_passage_index`` is 1-based into ``retrieved`` (0 = none).
+    Passages in the finding are in retrieval/rerank order (best first).
+    """
     passages = [_passage_for_nli(c) for c, _ in retrieved]
     messages = [
         {"role": "system", "content": NLI_SYSTEM},
@@ -61,14 +62,28 @@ def classify_claim(
         messages=messages,
     )
 
+    chunk_ids: list[str] = []
+    global_ids: list[int] = []
+    for chunk, _ in retrieved:
+        chunk_ids.append(chunk.chunk_id)
+        if isinstance(chunk, IndexedChunk):
+            global_ids.append(int(chunk.global_id))
+        else:
+            global_ids.append(-1)
+
+    matched = int(judgment.matched_passage_index)
+    if matched < 0 or matched > len(retrieved):
+        matched = 0
+
     # Citations always come from retrieval — never from the LLM.
     finding = ContradictionFinding(
         transcript_claim=claim.claim,
         source_speaker=claim.speaker,
         retrieved_filing_passages=[c.text for c, _ in retrieved],
-        source_sections=[_passage_section_label(c) for c, _ in retrieved],
+        chunk_ids=chunk_ids,
+        global_ids=global_ids,
         classification=judgment.classification,
         confidence_score=judgment.confidence_score,
         reasoning=judgment.reasoning,
     )
-    return finding, model
+    return finding, model, matched

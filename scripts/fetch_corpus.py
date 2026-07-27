@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
-"""Fetch EDGAR filings + Motley Fool transcripts from the company manifest.
+"""Fetch EDGAR filings + earnings-call transcripts from the company manifest.
 
 Examples::
 
-    # All rows with include: true in the manifest
+    # fetch everyinclude: true companies / fetch: true quarters
     python scripts/fetch_corpus.py
-    
-    # Fetch filing + transcript for AAPL (from data/manifests/companies.yml)
+
+    # By ticker (overrides include: false for that ticker)
     python scripts/fetch_corpus.py --ticker AAPL
+    python scripts/fetch_corpus.py --ticker AAPL --ticker MSFT
 
-    # Force a ticker even if include: false
-    python scripts/fetch_corpus.py --ticker MSFT
+    # By year / quarter (alone or combined)
+    python scripts/fetch_corpus.py --year 2025
+    python scripts/fetch_corpus.py --quarter Q2
+    python scripts/fetch_corpus.py --year 2025 --quarter Q1
+    python scripts/fetch_corpus.py --ticker AAPL --year 2025 --quarter Q3
 
-    # Only one side
+    # Every manifest row (ignore include)
+    python scripts/fetch_corpus.py --all
+    python scripts/fetch_corpus.py --all --year 2025 --quarter Q4
+
+    # Filings or transcripts only
+    python scripts/fetch_corpus.py --filings-only
+    python scripts/fetch_corpus.py --transcripts-only
     python scripts/fetch_corpus.py --ticker AAPL --filings-only
+    python scripts/fetch_corpus.py --ticker AAPL --year 2025 --transcripts-only
+
+    # Re-download even if files already exist
+    python scripts/fetch_corpus.py --force
+    python scripts/fetch_corpus.py --ticker AAPL --quarter Q1 --force
     python scripts/fetch_corpus.py --ticker AAPL --transcripts-only --force
 
 Writes under year-first paths::
@@ -38,6 +53,7 @@ from crosscheck.manifest import (  # noqa: E402
     filter_manifest,
     load_manifest,
 )
+from crosscheck.models import quarter_number  # noqa: E402
 
 
 def main() -> None:
@@ -62,19 +78,43 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--year",
+        type=int,
+        action="append",
+        dest="years",
+        help="Filter to fiscal year(s); repeatable (e.g. --year 2025).",
+    )
+    parser.add_argument(
+        "--quarter",
+        action="append",
+        dest="quarters",
+        help="Filter to fiscal quarter(s); repeatable (Q1–Q4 or 1–4).",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Fetch every manifest row, ignoring the include flag.",
     )
     parser.add_argument("--filings-only", action="store_true")
     parser.add_argument("--transcripts-only", action="store_true")
-    parser.add_argument("--force", action="store_true", help="Re-download even if present.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if present.",
+    )
     args = parser.parse_args()
 
     if args.filings_only and args.transcripts_only:
         parser.error("Use only one of --filings-only / --transcripts-only")
     if args.all and args.tickers:
         parser.error("Use only one of --all / --ticker")
+
+    quarter_nums: list[int] | None = None
+    if args.quarters:
+        try:
+            quarter_nums = [quarter_number(q) for q in args.quarters]
+        except ValueError as exc:
+            parser.error(str(exc))
 
     do_filings = not args.transcripts_only
     do_transcripts = not args.filings_only
@@ -83,17 +123,19 @@ def main() -> None:
     rows = filter_manifest(
         manifest,
         tickers=args.tickers,
+        years=args.years,
+        quarters=quarter_nums,
         include_only=not args.all,
     )
     if not rows:
         print(
             "No matching periods in manifest. "
             "Set company include: true and quarters.*.fetch: true, "
-            "pass --ticker (with fetch: true quarters), or use --all."
+            "or pass --ticker / --year / --quarter / --all."
         )
         sys.exit(1)
 
-    labels = [f"{r.ticker} Q{r.fiscal_quarter}" for r in rows]
+    labels = [f"{r.ticker} FY{r.fiscal_year} Q{r.fiscal_quarter}" for r in rows]
     print(
         f"Fetching {len(rows)} period"
         f"{'' if len(rows) == 1 else 's'}: {', '.join(labels)}"

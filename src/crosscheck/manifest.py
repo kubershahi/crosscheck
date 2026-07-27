@@ -203,6 +203,8 @@ def filter_manifest(
     manifest: Manifest,
     *,
     tickers: list[str] | None = None,
+    years: list[int] | None = None,
+    quarters: list[int] | None = None,
     include_only: bool = True,
 ) -> list[CompanyPeriod]:
     """Select company-years, then expand ``fetch: true`` quarters to periods.
@@ -211,6 +213,9 @@ def filter_manifest(
     company-years with ``include: true`` are considered. An explicit
     ``--ticker`` list ignores company ``include`` so you can force a one-off
     fetch. In all cases, only quarters with ``fetch: true`` are expanded.
+
+    Optional ``years`` / ``quarters`` further restrict the expanded periods
+    (quarters are ints 1–4).
     """
     rows = list(manifest.companies)
     if tickers:
@@ -219,7 +224,15 @@ def filter_manifest(
     elif include_only:
         rows = [c for c in rows if c.include]
 
+    if years:
+        year_set = set(years)
+        rows = [c for c in rows if c.fiscal_year in year_set]
+
     periods: list[CompanyPeriod] = []
     for company in rows:
         periods.extend(company.to_periods(fetch_only=True))
+
+    if quarters:
+        q_set = set(quarters)
+        periods = [p for p in periods if p.fiscal_quarter in q_set]
     return periods

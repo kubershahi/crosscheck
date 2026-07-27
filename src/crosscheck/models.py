@@ -207,6 +207,14 @@ class NLIJudgment(BaseModel):
     classification: Classification
     confidence_score: float = Field(ge=0.0, le=1.0)
     reasoning: str
+    matched_passage_index: int = Field(
+        ge=0,
+        le=20,
+        description=(
+            "1-based index of the filing passage that best supports or "
+            "contradicts the claim; 0 if none of the passages are usable."
+        ),
+    )
 
 
 class ContradictionFinding(BaseModel):
@@ -215,7 +223,8 @@ class ContradictionFinding(BaseModel):
     transcript_claim: str
     source_speaker: str
     retrieved_filing_passages: list[str]
-    source_sections: list[str]
+    chunk_ids: list[str] = Field(default_factory=list)
+    global_ids: list[int] = Field(default_factory=list)
     classification: Classification
     confidence_score: float = Field(ge=0.0, le=1.0)
     reasoning: str

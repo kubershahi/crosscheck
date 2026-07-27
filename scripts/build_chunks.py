@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 """Chunk raw filing/transcript pairs and write JSONL under data/chunks/{year}/.
 
+By default only builds outputs that are missing. Use ``--force`` to rebuild.
+
 Examples::
 
-    # Every complete filing/transcript pair currently under data/raw
+    # Chunk every complete raw pair that does not already have JSONL
     python scripts/build_chunks.py
 
-    # One ticker or a comma-separated subset
+    # By ticker
     python scripts/build_chunks.py --ticker AAPL
     python scripts/build_chunks.py --ticker AAPL,MSFT,NVDA
+
+    # By year / quarter (alone or combined)
+    python scripts/build_chunks.py --year 2025
+    python scripts/build_chunks.py --quarter Q2
+    python scripts/build_chunks.py --year 2025 --quarter Q1
+    python scripts/build_chunks.py --ticker AAPL --year 2025 --quarter Q3
+
+    # Rebuild even if chunk JSONL already exists
+    python scripts/build_chunks.py --force
+    python scripts/build_chunks.py --ticker AAPL --force
+    python scripts/build_chunks.py --ticker AAPL --year 2025 --quarter Q2 --force
 
 Output::
 
@@ -29,7 +42,7 @@ from crosscheck.chunking.pipeline import (  # noqa: E402
     build_chunks_for_period,
     discover_raw_periods,
 )
-from crosscheck.models import Chunk  # noqa: E402
+from crosscheck.models import Chunk, quarter_number  # noqa: E402
 
 
 def _parse_tickers(value: str | None) -> list[str] | None:
@@ -68,13 +81,42 @@ def main() -> None:
         "--ticker",
         help="Optional ticker or comma-separated subset (e.g. AAPL,MSFT).",
     )
+    parser.add_argument(
+        "--year",
+        type=int,
+        action="append",
+        dest="years",
+        help="Filter to fiscal year(s); repeatable (e.g. --year 2025).",
+    )
+    parser.add_argument(
+        "--quarter",
+        action="append",
+        dest="quarters",
+        help="Filter to fiscal quarter(s); repeatable (Q1–Q4 or 1–4).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-chunk and overwrite JSONL that already exists.",
+    )
     args = parser.parse_args()
     tickers = _parse_tickers(args.ticker)
     if args.ticker is not None and not tickers:
         parser.error("--ticker must contain at least one ticker")
 
+    quarter_nums: list[int] | None = None
+    if args.quarters:
+        try:
+            quarter_nums = [quarter_number(q) for q in args.quarters]
+        except ValueError as exc:
+            parser.error(str(exc))
+
     try:
-        periods = discover_raw_periods(tickers=tickers)
+        periods = discover_raw_periods(
+            tickers=tickers,
+            years=args.years,
+            quarters=quarter_nums,
+        )
     except ValueError as exc:
         print(exc)
         sys.exit(1)
@@ -85,7 +127,9 @@ def main() -> None:
         label = f"{period.ticker} FY{period.fiscal_year} {period.fiscal_quarter}"
         print(f"[{label}] chunking …")
         try:
-            result = build_chunks_for_period(period, write=True)
+            result = build_chunks_for_period(
+                period, write=True, force=args.force
+            )
         except FileNotFoundError as exc:
             print(f"  skip: {exc}")
             continue
@@ -94,11 +138,20 @@ def main() -> None:
         transcript_chunks = result["transcript_chunks"]
         assert isinstance(filing_chunks, list)
         assert isinstance(transcript_chunks, list)
-        _summary(filing_chunks, "filing")
-        _summary(transcript_chunks, "transcript")
-        if result["filing_out"]:
-            print(f"  wrote {result['filing_out']}")
-            print(f"  wrote {result['transcript_out']}")
+
+        if result["skipped_filing"]:
+            print(f"  skip filing (exists): {result['filing_out']}")
+        else:
+            _summary(filing_chunks, "filing")
+            if result["filing_out"]:
+                print(f"  wrote {result['filing_out']}")
+
+        if result["skipped_transcript"]:
+            print(f"  skip transcript (exists): {result['transcript_out']}")
+        else:
+            _summary(transcript_chunks, "transcript")
+            if result["transcript_out"]:
+                print(f"  wrote {result['transcript_out']}")
 
 
 if __name__ == "__main__":

@@ -131,10 +131,14 @@ def build_chunks_for_period(
     filing_path: Path | None = None,
     transcript_path: Path | None = None,
     write: bool = True,
-) -> dict[str, list[Chunk] | Path | None]:
+    force: bool = False,
+) -> dict[str, list[Chunk] | Path | bool | None]:
     """Chunk filing + transcript for one discovered period.
 
-    Returns chunk lists plus source/output paths.
+    By default, skips sides whose JSONL already exists. Pass ``force=True`` to
+    re-chunk and overwrite.
+
+    Returns chunk lists plus source/output paths and skip flags.
     """
     form = period.form or ("10-K" if period.fiscal_quarter == "Q4" else "10-Q")
     fy = period.fiscal_year
@@ -165,6 +169,15 @@ def build_chunks_for_period(
             f"Run fetch_corpus or drop a .txt under {transcript_dir(ticker, fy)}"
         )
 
+    filing_out_path = chunk_output_path(
+        ticker, doc_type=form, fiscal_year=fy, fiscal_quarter=fq
+    )
+    transcript_out_path = chunk_output_path(
+        ticker, doc_type="transcript", fiscal_year=fy, fiscal_quarter=fq
+    )
+    skip_filing = write and filing_out_path.exists() and not force
+    skip_transcript = write and transcript_out_path.exists() and not force
+
     base = DocumentMeta(
         ticker=ticker,
         company_name=period.company_name,
@@ -172,34 +185,39 @@ def build_chunks_for_period(
         fiscal_quarter=fq,
         form=form,
     )
-    filing_meta = enrich_filing_meta(base, filing)
-    transcript_meta = enrich_transcript_meta(base, transcript)
 
-    filing_chunks = chunk_filing_path(filing, filing_meta)
-    transcript_chunks = chunk_transcript_path(transcript, transcript_meta)
-
+    filing_chunks: list[Chunk] = []
+    transcript_chunks: list[Chunk] = []
     filing_out: Path | None = None
     transcript_out: Path | None = None
-    if write:
-        filing_doc = filing_chunks[0].doc_type if filing_chunks else form
-        filing_out = write_chunks_jsonl(
-            filing_chunks,
-            chunk_output_path(
-                ticker,
-                doc_type=filing_doc,
-                fiscal_year=fy,
-                fiscal_quarter=fq,
-            ),
-        )
-        transcript_out = write_chunks_jsonl(
-            transcript_chunks,
-            chunk_output_path(
-                ticker,
-                doc_type="transcript",
-                fiscal_year=fy,
-                fiscal_quarter=fq,
-            ),
-        )
+
+    if skip_filing:
+        filing_out = filing_out_path
+    else:
+        filing_meta = enrich_filing_meta(base, filing)
+        filing_chunks = chunk_filing_path(filing, filing_meta)
+        if write:
+            filing_doc = filing_chunks[0].doc_type if filing_chunks else form
+            filing_out = write_chunks_jsonl(
+                filing_chunks,
+                chunk_output_path(
+                    ticker,
+                    doc_type=filing_doc,
+                    fiscal_year=fy,
+                    fiscal_quarter=fq,
+                ),
+            )
+
+    if skip_transcript:
+        transcript_out = transcript_out_path
+    else:
+        transcript_meta = enrich_transcript_meta(base, transcript)
+        transcript_chunks = chunk_transcript_path(transcript, transcript_meta)
+        if write:
+            transcript_out = write_chunks_jsonl(
+                transcript_chunks,
+                transcript_out_path,
+            )
 
     return {
         "filing_chunks": filing_chunks,
@@ -208,19 +226,25 @@ def build_chunks_for_period(
         "transcript_path": transcript,
         "filing_out": filing_out,
         "transcript_out": transcript_out,
+        "skipped_filing": skip_filing,
+        "skipped_transcript": skip_transcript,
     }
 
 
 def discover_raw_periods(
     *,
     tickers: list[str] | None = None,
+    years: list[int] | None = None,
+    quarters: list[int] | None = None,
     filings_root: Path = FILINGS_DIR,
     transcripts_root: Path = TRANSCRIPTS_DIR,
 ) -> list[DocumentMeta]:
-    """Discover complete raw periods, optionally limited to requested tickers."""
+    """Discover complete raw periods, optionally limited by ticker / year / quarter."""
     periods: list[DocumentMeta] = []
     missing: list[str] = []
     requested = tickers is not None
+    year_set = set(years) if years else None
+    quarter_set = set(quarters) if quarters else None
     if tickers is None:
         tickers = sorted(
             {
@@ -239,6 +263,8 @@ def discover_raw_periods(
                 directory_year = int(ticker_dir.parent.name)
             except ValueError:
                 continue
+            if year_set is not None and directory_year not in year_set:
+                continue
             for transcript in sorted(ticker_dir.glob("FY*_Q*.txt")):
                 stem_parts = transcript.stem.split("_")
                 if len(stem_parts) != 2:
@@ -252,6 +278,10 @@ def discover_raw_periods(
                 except ValueError:
                     continue
                 if fiscal_year != directory_year or fiscal_quarter not in range(1, 5):
+                    continue
+                if year_set is not None and fiscal_year not in year_set:
+                    continue
+                if quarter_set is not None and fiscal_quarter not in quarter_set:
                     continue
 
                 form = "10-K" if fiscal_quarter == 4 else "10-Q"
