@@ -238,6 +238,162 @@ def period_filter(
     return models.Filter(must=must)
 
 
+def retrieval_filter_from_plan(
+    *,
+    temporal_scope: str,
+    ticker: str | None = None,
+    fiscal_year: int | None = None,
+    fiscal_quarter: str | None = None,
+    doc_types: set[str] | None = None,
+) -> models.Filter | None:
+    """Build Qdrant filter from a query temporal scope (+ optional overrides).
+
+    When ``doc_types`` is provided by the caller it is used only for
+    ``STANDARD_QUARTER`` (legacy override). Temporal scopes always set
+    doc_type / fiscal_period explicitly.
+    """
+    from crosscheck.retrieval.query_processor import TemporalScope
+
+    must: list[models.Condition] = []
+    if ticker:
+        must.append(
+            models.FieldCondition(
+                key="ticker",
+                match=models.MatchValue(value=ticker.upper()),
+            )
+        )
+    if fiscal_year is not None:
+        must.append(
+            models.FieldCondition(
+                key="fiscal_year",
+                match=models.MatchValue(value=int(fiscal_year)),
+            )
+        )
+
+    scope = (
+        temporal_scope
+        if isinstance(temporal_scope, TemporalScope)
+        else TemporalScope(str(temporal_scope))
+    )
+
+    if scope == TemporalScope.FULL_YEAR_ONLY:
+        must.append(
+            models.FieldCondition(
+                key="doc_type",
+                match=models.MatchValue(value="10-K"),
+            )
+        )
+        must.append(
+            models.FieldCondition(
+                key="fiscal_period",
+                match=models.MatchValue(value="FY"),
+            )
+        )
+    elif scope == TemporalScope.Q4_COMPOSITE:
+        # Composite Q4 uses dual-path retrieval (see retrieve_claim_passages).
+        pass
+    else:
+        # STANDARD_QUARTER: 10-Q for the claim period (caller fiscal_quarter).
+        if doc_types:
+            must.append(
+                models.FieldCondition(
+                    key="doc_type",
+                    match=models.MatchAny(any=sorted(doc_types)),
+                )
+            )
+        else:
+            must.append(
+                models.FieldCondition(
+                    key="doc_type",
+                    match=models.MatchValue(value="10-Q"),
+                )
+            )
+        if fiscal_quarter is not None:
+            wanted = as_fiscal_quarter(fiscal_quarter)
+            must.append(
+                models.FieldCondition(
+                    key="fiscal_period",
+                    match=models.MatchValue(value=wanted),
+                )
+            )
+
+    if not must:
+        return None
+    return models.Filter(must=must)
+
+
+def composite_10k_fy_filter(
+    *,
+    ticker: str | None = None,
+    fiscal_year: int | None = None,
+) -> models.Filter | None:
+    """Q4 composite Path A: FY 10-K only."""
+    must: list[models.Condition] = []
+    if ticker:
+        must.append(
+            models.FieldCondition(
+                key="ticker",
+                match=models.MatchValue(value=ticker.upper()),
+            )
+        )
+    if fiscal_year is not None:
+        must.append(
+            models.FieldCondition(
+                key="fiscal_year",
+                match=models.MatchValue(value=int(fiscal_year)),
+            )
+        )
+    must.append(
+        models.FieldCondition(
+            key="doc_type",
+            match=models.MatchValue(value="10-K"),
+        )
+    )
+    must.append(
+        models.FieldCondition(
+            key="fiscal_period",
+            match=models.MatchValue(value="FY"),
+        )
+    )
+    return models.Filter(must=must)
+
+
+def composite_q3_10q_filter(
+    *,
+    ticker: str | None = None,
+    fiscal_year: int | None = None,
+) -> models.Filter | None:
+    """Q4 composite Path B: Q3 10-Q (9-month YTD) only."""
+    must: list[models.Condition] = []
+    if ticker:
+        must.append(
+            models.FieldCondition(
+                key="ticker",
+                match=models.MatchValue(value=ticker.upper()),
+            )
+        )
+    if fiscal_year is not None:
+        must.append(
+            models.FieldCondition(
+                key="fiscal_year",
+                match=models.MatchValue(value=int(fiscal_year)),
+            )
+        )
+    must.append(
+        models.FieldCondition(
+            key="doc_type",
+            match=models.MatchValue(value="10-Q"),
+        )
+    )
+    must.append(
+        models.FieldCondition(
+            key="fiscal_period",
+            match=models.MatchValue(value="Q3"),
+        )
+    )
+    return models.Filter(must=must)
+
+
 def upsert_corpus(
     corpus: CorpusKind,
     chunks: list[IndexedChunk],
@@ -400,8 +556,13 @@ def hybrid_search(
     prefetch_k: int | None = None,
     client: QdrantClient | None = None,
     corpus: CorpusKind = "filings",
+    query_filter: models.Filter | None = None,
 ) -> list[tuple[IndexedChunk, float]]:
-    """Dense + BM25 prefetch with RRF fusion and period payload filters."""
+    """Dense + BM25 prefetch with RRF fusion and period payload filters.
+
+    Pass ``query_filter`` to override the default ``period_filter`` (used by
+    temporal query preprocessing).
+    """
     if k < 1:
         return []
     text = (query_text or "").strip()
@@ -423,11 +584,15 @@ def hybrid_search(
             f"query dense dim {vec.shape[0]} != {EMBEDDING_DIMENSION}"
         )
 
-    q_filter = period_filter(
-        ticker=ticker,
-        fiscal_year=fiscal_year,
-        fiscal_quarter=fiscal_quarter,
-        doc_types=doc_types,
+    q_filter = (
+        query_filter
+        if query_filter is not None
+        else period_filter(
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            doc_types=doc_types,
+        )
     )
 
     response = client.query_points(

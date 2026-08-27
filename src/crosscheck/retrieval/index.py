@@ -14,8 +14,6 @@ from typing import Literal
 
 import faiss
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from crosscheck.chunking.store import (
@@ -25,6 +23,7 @@ from crosscheck.chunking.store import (
 from crosscheck.config import EMBEDDING_MODEL, INDICES_DIR
 from crosscheck.models import Chunk, IndexedChunk
 from crosscheck.retrieval.embeddings import (
+    EmbeddingModel,
     chunk_embedding_text,
     embed_texts,
     load_embedding_model,
@@ -162,50 +161,31 @@ def merge_corpus_chunks(corpus: CorpusKind, *, force: bool = False) -> Path:
 
 def _write_embedding_batch(
     *,
-    model: SentenceTransformer,
+    model: EmbeddingModel,
     texts: list[str],
     target: np.memmap,
     start_idx: int,
-    device: str,
 ) -> int:
-    """Encode one mini-batch and write it directly to the disk memmap."""
+    """Encode one mini-batch via ``embed_texts`` and write to the disk memmap."""
     if not texts:
         return start_idx
 
     end_idx = start_idx + len(texts)
-    vecs: np.ndarray | None = None
-    try:
-        with torch.no_grad():
-            vecs = model.encode(
-                texts,
-                batch_size=len(texts),
-                device=device,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-        vecs = np.asarray(vecs, dtype=np.float32)
-        expected_shape = (len(texts), EMBEDDING_DIMENSION)
-        if vecs.shape != expected_shape:
-            raise RuntimeError(
-                f"Expected embedding shape {expected_shape}, got {vecs.shape}"
-            )
-        target[start_idx:end_idx] = vecs
-        target.flush()
-        return end_idx
-    finally:
-        del vecs
-        texts.clear()
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+    vecs = embed_texts(model, texts, batch_size=len(texts))
+    expected_shape = (len(texts), EMBEDDING_DIMENSION)
+    if vecs.shape != expected_shape:
+        raise RuntimeError(
+            f"Expected embedding shape {expected_shape}, got {vecs.shape}"
+        )
+    target[start_idx:end_idx] = vecs
+    target.flush()
+    texts.clear()
+    return end_idx
 
 
 def stream_embeddings_to_memmap(
     *,
-    model: SentenceTransformer,
+    model: EmbeddingModel,
     chunks_path: Path,
     output_path: Path,
     batch_size: int = 16,
@@ -228,13 +208,13 @@ def stream_embeddings_to_memmap(
         mode="w+",
         shape=(total_chunks, EMBEDDING_DIMENSION),
     )
-    device = resolve_device()
+    backend = resolve_device()
     batch_texts: list[str] = []
     written = 0
 
     print(
         f"  streaming {total_chunks} chunks → {output_path} "
-        f"(batch_size={batch_size}, device={device})",
+        f"(batch_size={batch_size}, device={backend})",
         flush=True,
     )
 
@@ -267,7 +247,6 @@ def stream_embeddings_to_memmap(
                         texts=batch_texts,
                         target=fp,
                         start_idx=written,
-                        device=device,
                     )
                     pbar.update(n)
 
@@ -278,7 +257,6 @@ def stream_embeddings_to_memmap(
                     texts=batch_texts,
                     target=fp,
                     start_idx=written,
-                    device=device,
                 )
                 pbar.update(n)
 
@@ -290,8 +268,6 @@ def stream_embeddings_to_memmap(
     finally:
         del fp
         batch_texts.clear()
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
         gc.collect()
 
     return output_path, total_chunks
@@ -324,7 +300,7 @@ def build_faiss_from_memmap(
 def build_corpus_index(
     corpus: CorpusKind,
     *,
-    model: SentenceTransformer | None = None,
+    model: EmbeddingModel | None = None,
     force: bool = False,
     batch_size: int = 16,
 ) -> Path:
@@ -397,7 +373,7 @@ def build_corpus_index(
 
 def build_all_indices(
     *,
-    model: SentenceTransformer | None = None,
+    model: EmbeddingModel | None = None,
     force: bool = False,
     batch_size: int = 16,
     corpora: list[CorpusKind] | None = None,
@@ -494,7 +470,7 @@ def load_master_index() -> CorpusIndex:
 def retrieve(
     query: str,
     master: CorpusIndex,
-    model: SentenceTransformer,
+    model: EmbeddingModel,
     *,
     k: int = 5,
     ticker: str | None = None,
@@ -547,7 +523,7 @@ def retrieve(
 def hybrid_retrieve(
     query: str,
     corpus: CorpusIndex,
-    model: SentenceTransformer,
+    model: EmbeddingModel,
     *,
     k: int = 5,
     ticker: str | None = None,
@@ -556,25 +532,61 @@ def hybrid_retrieve(
     doc_types: set[str] | None = None,
     candidate_multiplier: int = 20,
     rrf_k: int = 60,
+    preprocess: bool = True,
 ) -> list[tuple[IndexedChunk, float]]:
-    """Hybrid retrieve: Qdrant dense+BM25+RRF (filings or transcripts)."""
+    """Hybrid retrieve: Qdrant dense+BM25+RRF (filings or transcripts).
+
+    When ``preprocess`` is True (default), financial unit expansion and
+    temporal scope routing run before embed/BM25. Rerankers should still use
+    the original claim text (callers keep the raw claim for cross-encoders).
+    """
     if k < 1:
         return []
+
+    search_query = query
+    q_filter = None
+    effective_doc_types = doc_types
+    effective_quarter = fiscal_quarter
+
+    if preprocess:
+        from crosscheck.retrieval.query_processor import (
+            TemporalScope,
+            prepare_claim_query,
+        )
+        from crosscheck.retrieval.qdrant_store import retrieval_filter_from_plan
+
+        plan = prepare_claim_query(query, fiscal_quarter=fiscal_quarter)
+        search_query = plan.processed_query
+        if corpus.backend == "qdrant" and corpus.corpus == "filings":
+            q_filter = retrieval_filter_from_plan(
+                temporal_scope=plan.temporal_scope,
+                ticker=ticker,
+                fiscal_year=fiscal_year,
+                fiscal_quarter=fiscal_quarter,
+                doc_types=doc_types,
+            )
+            effective_doc_types = set(plan.required_doc_types)
+            if plan.temporal_scope == TemporalScope.FULL_YEAR_ONLY:
+                effective_quarter = None
+            elif plan.temporal_scope == TemporalScope.Q4_COMPOSITE:
+                # Composite Q4 uses retrieve_claim_passages (dual path), not union search.
+                effective_quarter = None
 
     if corpus.backend == "qdrant":
         from crosscheck.retrieval.qdrant_store import hybrid_search
 
-        query_vec = embed_texts(model, [query.strip()])[0]
+        query_vec = embed_texts(model, [search_query.strip()])[0]
         return hybrid_search(
-            query,
+            search_query,
             query_vec,
             k=k,
             ticker=ticker,
             fiscal_year=fiscal_year,
-            fiscal_quarter=fiscal_quarter,
-            doc_types=doc_types,
+            fiscal_quarter=effective_quarter,
+            doc_types=effective_doc_types,
             prefetch_k=max(k, 20),
             corpus=corpus.corpus,
+            query_filter=q_filter,
         )
 
     channel_k = max(k, 20)
@@ -586,7 +598,7 @@ def hybrid_retrieve(
             corpus.index.ntotal,
             max(channel_k * candidate_multiplier, channel_k),
         )
-        query_vec = embed_texts(model, [query.strip()])
+        query_vec = embed_texts(model, [search_query.strip()])
         scores, indices = corpus.index.search(query_vec, search_k)
         ticker_u = ticker.upper() if ticker else None
         dense = []
@@ -596,11 +608,11 @@ def hybrid_retrieve(
             chunk = corpus.chunks[int(idx)]
             if ticker_u and chunk.ticker != ticker_u:
                 continue
-            if doc_types and chunk.doc_type not in doc_types:
+            if effective_doc_types and chunk.doc_type not in effective_doc_types:
                 continue
             if fiscal_year is not None and chunk.fiscal_year != fiscal_year:
                 continue
-            if not period_matches(chunk.fiscal_period, fiscal_quarter):
+            if not period_matches(chunk.fiscal_period, effective_quarter):
                 continue
             dense.append((chunk, float(score)))
             if len(dense) >= channel_k:
@@ -609,13 +621,13 @@ def hybrid_retrieve(
     sparse: list[tuple[IndexedChunk, float]] = []
     if corpus.bm25 is not None:
         sparse = bm25_retrieve(
-            query,
+            search_query,
             corpus.bm25,
             k=channel_k,
             ticker=ticker,
             fiscal_year=fiscal_year,
-            fiscal_quarter=fiscal_quarter,
-            doc_types=doc_types,
+            fiscal_quarter=effective_quarter,
+            doc_types=effective_doc_types,
         )
 
     if not dense and not sparse:
@@ -625,3 +637,158 @@ def hybrid_retrieve(
     if not dense:
         return sparse[:k]
     return rrf_fuse([dense, sparse], k=rrf_k, top_n=k)
+
+
+Q4_COMPOSITE_PATH_K = 4
+
+
+def _dedupe_chunks(
+    items: list[tuple[IndexedChunk, float]],
+) -> list[tuple[IndexedChunk, float]]:
+    """Drop duplicate chunk_id entries while preserving order."""
+    seen: set[str] = set()
+    out: list[tuple[IndexedChunk, float]] = []
+    for chunk, score in items:
+        if chunk.chunk_id in seen:
+            continue
+        seen.add(chunk.chunk_id)
+        out.append((chunk, score))
+    return out
+
+
+def _qdrant_hybrid_path(
+    search_query: str,
+    corpus: CorpusIndex,
+    model: EmbeddingModel,
+    *,
+    query_filter: object,
+    pool_k: int,
+    final_k: int,
+    rerank_query: str | None = None,
+    reranker: object | None = None,
+) -> list[tuple[IndexedChunk, float]]:
+    """One hybrid prefetch pool + optional rerank cap (Q4 composite subpath)."""
+    from crosscheck.retrieval.qdrant_store import hybrid_search
+    from crosscheck.retrieval.rerank import rerank_claim_passages
+
+    query_vec = embed_texts(model, [search_query.strip()])[0]
+    hybrid = hybrid_search(
+        search_query,
+        query_vec,
+        k=pool_k,
+        prefetch_k=max(pool_k, 20),
+        corpus=corpus.corpus,
+        query_filter=query_filter,
+    )
+    if reranker is not None:
+        rq = rerank_query if rerank_query is not None else search_query
+        return rerank_claim_passages(rq, hybrid, top_k=final_k, model=reranker)
+    return hybrid[:final_k]
+
+
+def _retrieve_q4_composite(
+    corpus: CorpusIndex,
+    model: EmbeddingModel,
+    *,
+    ticker: str | None,
+    fiscal_year: int | None,
+    plan: object,
+    pool_k: int,
+    reranker: object | None,
+) -> list[tuple[IndexedChunk, float]]:
+    """Dual full-stack retrieval for Q4 composite: 10-K FY + Q3 10-Q (3+3)."""
+    from crosscheck.retrieval.qdrant_store import (
+        composite_10k_fy_filter,
+        composite_q3_10q_filter,
+    )
+    from crosscheck.retrieval.query_processor import (
+        fy_annual_retrieval_query,
+        q3_ytd_retrieval_query,
+    )
+
+    expanded = plan.processed_query  # type: ignore[attr-defined]
+    fy_query = fy_annual_retrieval_query(expanded)
+    ytd_query = q3_ytd_retrieval_query(expanded)
+    path_k = Q4_COMPOSITE_PATH_K
+    stage = "hybrid+rerank" if reranker is not None else "hybrid"
+
+    print(flush=True)
+    print(f"      path A [10-K FY] query: {fy_query}", flush=True)
+    path_a = _qdrant_hybrid_path(
+        fy_query,
+        corpus,
+        model,
+        query_filter=composite_10k_fy_filter(ticker=ticker, fiscal_year=fiscal_year),
+        pool_k=pool_k,
+        final_k=path_k,
+        rerank_query=fy_query,
+        reranker=reranker,
+    )
+    print(f"      path A {stage} → {len(path_a)}/{path_k}", flush=True)
+    print(f"      path B [Q3 10-Q] query: {ytd_query}", flush=True)
+    path_b = _qdrant_hybrid_path(
+        ytd_query,
+        corpus,
+        model,
+        query_filter=composite_q3_10q_filter(ticker=ticker, fiscal_year=fiscal_year),
+        pool_k=pool_k,
+        final_k=path_k,
+        rerank_query=ytd_query,
+        reranker=reranker,
+    )
+    print(f"      path B {stage} → {len(path_b)}/{path_k}", flush=True)
+    return _dedupe_chunks(path_a + path_b)
+
+
+def retrieve_claim_passages(
+    query: str,
+    corpus: CorpusIndex,
+    model: EmbeddingModel,
+    *,
+    k: int = 5,
+    ticker: str | None = None,
+    fiscal_year: int | None = None,
+    fiscal_quarter: str | None = None,
+    rerank_pool_k: int | None = None,
+    reranker: object | None = None,
+    use_reranker: bool = True,
+) -> list[tuple[IndexedChunk, float]]:
+    """Retrieve filing passages for one claim.
+
+    Q4 composite: two independent hybrid+rerank stacks (3+3), no post-merge cut.
+    Q1–Q3 / full-year-only: unchanged single hybrid → optional rerank → ``k``.
+    """
+    from crosscheck.retrieval.query_processor import TemporalScope, prepare_claim_query
+    from crosscheck.retrieval.rerank import rerank_claim_passages
+
+    plan = prepare_claim_query(query, fiscal_quarter=fiscal_quarter)
+    pool_k = rerank_pool_k if rerank_pool_k is not None else max(k * 10, 20)
+
+    if (
+        plan.temporal_scope == TemporalScope.Q4_COMPOSITE
+        and corpus.backend == "qdrant"
+        and corpus.corpus == "filings"
+    ):
+        return _retrieve_q4_composite(
+            corpus,
+            model,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            plan=plan,
+            pool_k=pool_k,
+            reranker=reranker if use_reranker else None,
+        )
+
+    retrieve_k = pool_k if (use_reranker and reranker is not None) else k
+    hybrid_retrieved = hybrid_retrieve(
+        query,
+        corpus,
+        model,
+        k=retrieve_k,
+        ticker=ticker,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+    )
+    if use_reranker and reranker is not None:
+        return rerank_claim_passages(query, hybrid_retrieved, top_k=k, model=reranker)
+    return hybrid_retrieved
