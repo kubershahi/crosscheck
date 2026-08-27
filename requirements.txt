@@ -9,7 +9,7 @@ python-dotenv>=1.0.0
 PyYAML>=6.0.0
 
 # Day 2 — embeddings, FAISS, structured LLM output
-sentence-transformers>=3.0.0
+sentence-transformers>=3.2.0
 faiss-cpu>=1.8.0
 instructor>=1.7.0
 openai>=1.50.0
@@ -17,6 +17,7 @@ google-genai>=1.0.0
 jsonref>=1.1.0
 torch>=2.2.0
 tqdm>=4.66.0
+pinecone>=5.0.0
 
 # Day 3+ (uncomment when needed)
 # rank_bm25

@@ -1,4 +1,7 @@
-"""BGE-M3 embeddings with contextual prefixes for master index assembly."""
+"""BGE-M3 embeddings with contextual prefixes for master index assembly.
+
+Uses SentenceTransformer on MPS/CUDA/CPU via ``CROSSCHECK_EMBEDDING_DEVICE``.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +14,8 @@ from sentence_transformers import SentenceTransformer
 
 from crosscheck.config import EMBEDDING_MODEL, get_embedding_device_pref
 from crosscheck.models import Chunk
+
+EmbeddingModel = SentenceTransformer
 
 
 def chunk_embedding_text(chunk: Chunk) -> str:
@@ -59,7 +64,7 @@ def chunk_embedding_text(chunk: Chunk) -> str:
 
 
 def resolve_device() -> str:
-    """Pick ``mps``, ``cuda``, or ``cpu`` based on env and availability."""
+    """Pick ``mps``, ``cuda``, or ``cpu`` for SentenceTransformer / CrossEncoder."""
     pref = get_embedding_device_pref()
     if pref == "cuda" and torch.cuda.is_available():
         return "cuda"
@@ -71,8 +76,8 @@ def resolve_device() -> str:
 
 
 @lru_cache(maxsize=1)
-def load_embedding_model(model_name: str | None = None) -> SentenceTransformer:
-    """Load and cache the sentence-transformer model."""
+def load_embedding_model(model_name: str | None = None) -> EmbeddingModel:
+    """Load and cache the SentenceTransformer embedder."""
     name = model_name or EMBEDDING_MODEL
     device = resolve_device()
     print(f"[embeddings] loading {name} on {device}", flush=True)
@@ -80,18 +85,19 @@ def load_embedding_model(model_name: str | None = None) -> SentenceTransformer:
 
 
 def embed_texts(
-    model: SentenceTransformer,
+    model: EmbeddingModel,
     texts: list[str],
     *,
     batch_size: int = 16,
 ) -> np.ndarray:
-    """Encode normalized vectors in small batches and purge accelerator memory.
+    """Encode L2-normalized float32 vectors in small batches.
 
-    Every batch is moved to a CPU NumPy array immediately. This avoids retaining
-    MPS tensors across the full corpus and mitigates PyTorch MPS memory growth.
+    Moves each batch to CPU NumPy immediately and clears accelerator caches
+    to limit MPS/CUDA growth.
     """
     if not texts:
-        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+        dim = int(model.get_sentence_embedding_dimension())
+        return np.zeros((0, dim), dtype=np.float32)
 
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
@@ -101,28 +107,17 @@ def embed_texts(
 
     for batch_number, start in enumerate(range(0, len(texts), batch_size), start=1):
         batch = texts[start : start + batch_size]
-        encoded: torch.Tensor | None = None
         try:
-            with torch.no_grad():
-                encoded = model.encode(
-                    batch,
-                    batch_size=len(batch),
-                    show_progress_bar=False,
-                    normalize_embeddings=True,
-                    convert_to_numpy=False,
-                    convert_to_tensor=True,
-                )
-
-            # Detach from MPS/CUDA immediately and retain only CPU float32 data.
-            cpu_array = (
-                encoded.detach()
-                .to(device="cpu", dtype=torch.float32)
-                .numpy()
-                .copy()
+            encoded = model.encode(
+                batch,
+                batch_size=len(batch),
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
             )
+            cpu_array = np.asarray(encoded, dtype=np.float32).copy()
             cpu_batches.append(cpu_array)
         finally:
-            del encoded
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
             if torch.cuda.is_available():
@@ -141,6 +136,5 @@ def embed_texts(
                 flush=True,
             )
 
-    # IndexFlatIP expects a contiguous float32 matrix. Vectors are already L2
-    # normalized, so inner product is cosine similarity.
+    # IndexFlatIP / Qdrant Dot expect contiguous float32; vectors are L2-normalized.
     return np.ascontiguousarray(np.vstack(cpu_batches), dtype=np.float32)

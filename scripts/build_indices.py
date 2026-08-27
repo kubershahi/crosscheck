@@ -10,9 +10,9 @@ Sequence (per corpus)::
 
 Examples::
 
-    python scripts/build_indices.py --corpus filings --force --batch-size 8
-    python scripts/build_indices.py --corpus transcripts --force
-    python scripts/build_indices.py --corpus both --force --batch-size 8
+    python scripts/build_indices.py --corpus filings --force
+    python scripts/build_indices.py --corpus transcripts --force --batch-size 32
+    python scripts/build_indices.py --corpus both --force
 
 Requires ``QDRANT_ENDPOINT`` + ``QDRANT_API_KEY`` in ``.env`` for Cloud.
 Prerequisite: ``python scripts/build_chunks.py``
@@ -56,8 +56,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Streaming embedding batch size (default: 8).",
+        default=32,
+        help="Streaming embedding batch size (default: 32).",
     )
     args = parser.parse_args()
     if args.batch_size < 1:

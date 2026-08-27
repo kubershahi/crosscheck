@@ -17,7 +17,8 @@ Layout (year-first)::
     data/indices/qdrant/                         # local Qdrant path fallback
     data/reports/{fiscal_year}/{TICKER}/
     data/runs/                                   # NLI run summary CSVs (run_<timestamp>.csv)
-    data/eval/                                   # golden-set candidates (candidates.jsonl)
+    data/eval/                                   # candidates.jsonl + eval/claims/
+    data/eval/claims/{fiscal_year}/{TICKER}/     # labeled golden claims
 
 Filings and transcripts NLI/retrieval use Qdrant Cloud (or local path) hybrid
 dense+BM25+RRF. Set ``QDRANT_ENDPOINT`` + ``QDRANT_API_KEY`` in ``.env``.
@@ -45,10 +46,13 @@ INDICES_DIR = DATA_DIR / "indices"
 REPORTS_DIR = DATA_DIR / "reports"
 RUNS_DIR = DATA_DIR / "runs"
 EVAL_DIR = DATA_DIR / "eval"
+EVAL_CLAIMS_DIR = EVAL_DIR / "claims"
 MANIFESTS_DIR = DATA_DIR / "manifests"
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+# Pinecone Inference model id (not the Hugging Face repo path).
+PINECONE_RERANK_MODEL = "bge-reranker-v2-m3"
 
 # Gemini model fallback order (highest free-tier RPM/RPD first).
 # Both development and production profiles use this same rank via resolve_llm_models().
@@ -104,13 +108,23 @@ def chunks_dir(ticker: str, fiscal_year: int) -> Path:
 
 
 def claims_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Path:
-    """Return the persisted claims JSON path for one company-period."""
+    """Return the persisted claims JSONL path for one company-period."""
     from crosscheck.models import as_fiscal_quarter
 
     ticker = ticker.upper()
     q = as_fiscal_quarter(fiscal_quarter)
-    name = f"{ticker}_FY{fiscal_year}_{q}_claims.json"
+    name = f"{ticker}_FY{fiscal_year}_{q}_claims.jsonl"
     return CLAIMS_DIR / str(fiscal_year) / ticker / name
+
+
+def eval_claims_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Path:
+    """Return golden-eval claims path under ``data/eval/claims/``."""
+    from crosscheck.models import as_fiscal_quarter
+
+    ticker = ticker.upper()
+    q = as_fiscal_quarter(fiscal_quarter)
+    name = f"{ticker}_FY{fiscal_year}_{q}_claims.jsonl"
+    return EVAL_CLAIMS_DIR / str(fiscal_year) / ticker / name
 
 
 def indices_dir(ticker: str, fiscal_year: int) -> Path:
@@ -180,8 +194,30 @@ def report_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Pat
 
 
 def get_embedding_device_pref() -> str:
-    """Return preferred embedding device: ``mps``, ``cuda``, or ``cpu``."""
+    """Return preferred local embed/rerank device: ``mps``, ``cuda``, or ``cpu``."""
     return os.getenv("CROSSCHECK_EMBEDDING_DEVICE", "mps").strip().lower()
+
+
+def get_rerank_backend() -> Literal["pinecone", "torch"]:
+    """Return rerank backend: ``pinecone`` (default) or ``torch`` (local MPS/CUDA/CPU).
+
+    Override with ``CROSSCHECK_RERANK_BACKEND=pinecone|local|torch``.
+    """
+    raw = os.getenv("CROSSCHECK_RERANK_BACKEND", "pinecone").strip().lower()
+    if raw in {"torch", "pytorch", "local", "mps", "gpu"}:
+        return "torch"
+    return "pinecone"
+
+
+def get_pinecone_api_key() -> str:
+    """Load ``PINECONE_API_KEY`` from the environment / ``.env``."""
+    key = os.getenv("PINECONE_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "Set PINECONE_API_KEY in .env for Pinecone Inference rerank "
+            "(or set CROSSCHECK_RERANK_BACKEND=local)."
+        )
+    return key
 
 
 def get_llm_profile() -> Literal["development", "production"]:
