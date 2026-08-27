@@ -100,7 +100,10 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-download even if present.",
+        help=(
+            "Re-download HTML even if present. Sidecar .meta.json is "
+            "refreshed on every fetch (with or without --force)."
+        ),
     )
     args = parser.parse_args()
 

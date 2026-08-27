@@ -35,13 +35,13 @@ import csv
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from crosscheck.analysis.claims import load_saved_claims  # noqa: E402
 from crosscheck.analysis.pipeline import run_pipeline  # noqa: E402
 from crosscheck.config import CLAIMS_DIR, RUNS_DIR, report_path  # noqa: E402
 from crosscheck.models import (  # noqa: E402
@@ -52,8 +52,19 @@ from crosscheck.models import (  # noqa: E402
     quarter_number,
 )
 
-# Pause between processed claim files (LLM RPM headroom).
-CLAIM_FILE_GAP_SECONDS = 10
+
+def _period_from_claims_path(path: Path) -> DocumentMeta:
+    parts = path.stem.split("_")
+    ticker = parts[0]
+    year_s = parts[1]
+    if year_s.upper().startswith("FY"):
+        year_s = year_s[2:]
+    return DocumentMeta(
+        ticker=ticker,
+        company_name=ticker,
+        fiscal_year=int(year_s),
+        fiscal_quarter=as_fiscal_quarter(parts[2]),
+    )
 
 
 def _discover_claim_files(
@@ -82,19 +93,22 @@ def _discover_claim_files(
         for ticker_dir in ticker_dirs:
             if not ticker_dir.is_dir():
                 continue
-            files.extend(sorted(ticker_dir.glob("*_claims.json")))
+            jsonl_files = sorted(ticker_dir.glob("*_claims.jsonl"))
+            if jsonl_files:
+                files.extend(jsonl_files)
+            else:
+                files.extend(sorted(ticker_dir.glob("*_claims.json")))
 
     if quarter is not None:
         wanted = as_fiscal_quarter(quarter)
         filtered: list[Path] = []
         for path in files:
             try:
-                saved = SavedTranscriptClaims.model_validate_json(
-                    path.read_text(encoding="utf-8")
-                )
-            except Exception:
+                parts = path.stem.split("_")
+                q = as_fiscal_quarter(parts[2])
+            except (ValueError, IndexError):
                 continue
-            if saved.fiscal_quarter == wanted:
+            if q == wanted:
                 filtered.append(path)
         files = filtered
 
@@ -118,9 +132,7 @@ def _load_reports_for_summary(
     reports: list[PipelineReport] = []
     for claim_file in claim_files:
         try:
-            saved = SavedTranscriptClaims.model_validate_json(
-                claim_file.read_text(encoding="utf-8")
-            )
+            saved = load_saved_claims(_period_from_claims_path(claim_file))
         except Exception:
             continue
         path = report_path(saved.ticker, saved.fiscal_year, saved.fiscal_quarter)
@@ -307,12 +319,6 @@ def main() -> None:
         choices=("development", "production", "test", "dev"),
         help="Override CROSSCHECK_LLM_PROFILE.",
     )
-    parser.add_argument(
-        "--gap-seconds",
-        type=int,
-        default=CLAIM_FILE_GAP_SECONDS,
-        help=f"Sleep between periods (default: {CLAIM_FILE_GAP_SECONDS}; 0=off).",
-    )
     args = parser.parse_args()
 
     if args.profile:
@@ -345,9 +351,7 @@ def main() -> None:
     work: list[tuple[Path, SavedTranscriptClaims, Path]] = []
     skipped = 0
     for claim_file in claim_files:
-        saved = SavedTranscriptClaims.model_validate_json(
-            claim_file.read_text(encoding="utf-8")
-        )
+        saved = load_saved_claims(_period_from_claims_path(claim_file))
         out = report_path(saved.ticker, saved.fiscal_year, saved.fiscal_quarter)
         if out.exists() and not args.force:
             skipped += 1
@@ -359,8 +363,6 @@ def main() -> None:
         + ("  (--force to overwrite)" if skipped and not args.force else "")
     )
     if work:
-        if args.gap_seconds > 0 and len(work) > 1:
-            print(f"gap={args.gap_seconds}s between periods")
         print()
 
         for index, (claim_file, saved, out) in enumerate(work):
@@ -394,12 +396,7 @@ def main() -> None:
                 encoding="utf-8",
             )
             print(f"  wrote {out}")
-
-            if args.gap_seconds > 0 and index < len(work) - 1:
-                print(f"\n  … sleep {args.gap_seconds}s\n", flush=True)
-                time.sleep(args.gap_seconds)
-            else:
-                print()
+            print()
     else:
         print("Nothing new to process; summarizing existing reports.")
         print()

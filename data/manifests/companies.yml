@@ -27,23 +27,23 @@ companies:
         fetch: true
         transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/31/apple-q4-2025-earnings-call-transcript/"
 
-  - ticker: MSFT
-    name: Microsoft
+  - ticker: AMZN
+    name: Amazon
     fiscal_year: 2025
     include: true
     quarters:
       Q1:
         fetch: true
-        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/10/30/microsoft-msft-q1-2025-earnings-call-transcript/"
+        transcript_url: "https://www.roic.ai/quote/AMZN/transcripts/2025-year/1-quarter"
       Q2:
         fetch: true
-        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/01/29/microsoft-msft-q2-2025-earnings-call-transcript/"
+        transcript_url: "https://www.roic.ai/quote/AMZN/transcripts/2025-year/2-quarter"
       Q3:
         fetch: true
-        transcript_url: "https://www.roic.ai/quote/MSFT/transcripts/2025-year/3-quarter"
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/10/31/amazon-amzn-q3-2025-earnings-call-transcript/"
       Q4:
         fetch: true
-        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/05/microsoft-msft-q4-2025-earnings-call-transcript/"
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/05/amazon-amzn-q4-2025-earnings-call-transcript/"
 
   - ticker: NVDA
     name: Nvidia
@@ -99,23 +99,23 @@ companies:
         fetch: true
         transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/01/28/meta-meta-q4-2025-earnings-call-transcript/"
 
-  - ticker: AMZN
-    name: Amazon
+  - ticker: MSFT
+    name: Microsoft
     fiscal_year: 2025
     include: false
     quarters:
       Q1:
         fetch: false
-        transcript_url: null
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2024/10/30/microsoft-msft-q1-2025-earnings-call-transcript/"
       Q2:
         fetch: false
-        transcript_url: null
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/01/29/microsoft-msft-q2-2025-earnings-call-transcript/"
       Q3:
         fetch: false
-        transcript_url: null
+        transcript_url: "https://www.roic.ai/quote/MSFT/transcripts/2025-year/3-quarter"
       Q4:
         fetch: false
-        transcript_url: "https://www.fool.com/earnings/call-transcripts/2026/02/05/amazon-amzn-q4-2025-earnings-call-transcript/"
+        transcript_url: "https://www.fool.com/earnings/call-transcripts/2025/08/05/microsoft-msft-q4-2025-earnings-call-transcript/"
 
   - ticker: TSLA
     name: Tesla

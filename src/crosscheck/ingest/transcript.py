@@ -77,9 +77,11 @@ KEEP_PREAMBLE = ("date", "call_participants", "industry_glossary")
 DROP_SECTIONS = {"takeaways", "summary", "risks", "contents"}
 
 # Bare speaker name on its own line (common on ROIC.ai): "Sundar Pichai"
-# Requires lowercase letters in each name token so tickers like "GOOG" do not match.
+# Full tokens need a lowercase letter so tickers like "GOOG" do not match.
+# Middle initials ("Andrew R. Jassy", "Brian T. Olsavsky") are allowed.
+_BARE_NAME_TOKEN = r"(?:[A-Z][a-z][A-Za-z.'\-]*|[A-Z]\.)"
 SPEAKER_BARE_NAME = re.compile(
-    r"^(?:Operator|[A-Z][a-z][A-Za-z.'\-]*(?:\s+[A-Z][a-z][A-Za-z.'\-]*){0,4})$"
+    rf"^(?:Operator|{_BARE_NAME_TOKEN}(?:\s+{_BARE_NAME_TOKEN}){{0,4}})$"
 )
 
 # "April 24, 2025" / "24 April 2025"
@@ -799,19 +801,102 @@ def source_label(url: str) -> str:
     return host or "unknown"
 
 
+def write_transcript_meta(
+    period: CompanyPeriod,
+    *,
+    url: str,
+    paths: dict[str, Path],
+    cleaned: str,
+    extracted: TranscriptExtract | None = None,
+    html_path: Path | None = None,
+) -> Path:
+    """Write / overwrite the transcript sidecar ``.meta.json``."""
+    participants = list(extracted.participants) if extracted else []
+    if not participants and cleaned:
+        participants = _harvest_participants_from_body(cleaned.splitlines())
+    html_ref = html_path
+    if html_ref is None:
+        if paths["html"].exists():
+            html_ref = paths["html"]
+        elif paths["html_legacy"].exists():
+            html_ref = paths["html_legacy"]
+    meta = {
+        "source": source_label(url) if url else "unknown",
+        "url": url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "ticker": period.ticker,
+        "company_name": period.name,
+        "fiscal_year": period.fiscal_year,
+        "fiscal_quarter": f"Q{period.fiscal_quarter}",
+        "chars": len(cleaned),
+        "call_date": extracted.call_date if extracted else None,
+        "call_participants": participants,
+        "raw_html": str(html_ref) if html_ref else "",
+        "cleaned_txt": str(paths["txt"]),
+    }
+    paths["meta"].write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return paths["meta"]
+
+
+def refresh_transcript_meta(
+    period: CompanyPeriod,
+    *,
+    url: str,
+    paths: dict[str, Path] | None = None,
+) -> Path:
+    """Rewrite sidecar meta from existing HTML / TXT (no network)."""
+    paths = paths or transcript_paths(period)
+    html_path: Path | None = None
+    if paths["html"].exists():
+        html_path = paths["html"]
+    elif paths["html_legacy"].exists():
+        html_path = paths["html_legacy"]
+
+    extracted: TranscriptExtract | None = None
+    if html_path is not None:
+        html = html_path.read_text(encoding="utf-8")
+        extracted = extract_transcript(
+            html,
+            url=url or "",
+            fiscal_year=period.fiscal_year,
+            fiscal_quarter=period.fiscal_quarter,
+        )
+
+    if paths["txt"].exists():
+        cleaned = paths["txt"].read_text(encoding="utf-8")
+    elif extracted is not None:
+        cleaned = extracted.text
+    else:
+        cleaned = ""
+
+    return write_transcript_meta(
+        period,
+        url=url,
+        paths=paths,
+        cleaned=cleaned,
+        extracted=extracted,
+        html_path=html_path,
+    )
+
+
 def fetch_transcript(
     period: CompanyPeriod,
     *,
     force: bool = False,
     allow_existing_txt: bool = True,
 ) -> Path:
-    """Fetch ``transcript_url`` for a company period; return cleaned ``.txt``."""
+    """Fetch ``transcript_url`` for a company period; return cleaned ``.txt``.
+
+    Sidecar ``.meta.json`` is rewritten on every call (including skips).
+    ``force`` re-downloads HTML and re-extracts TXT.
+    """
     url = period.transcript_url_str()
     paths = transcript_paths(period)
     paths["dir"].mkdir(parents=True, exist_ok=True)
 
     if url is None:
         if allow_existing_txt and paths["txt"].exists():
+            refresh_transcript_meta(period, url="", paths=paths)
             return paths["txt"]
         raise ValueError(
             f"No transcript_url for {period.ticker} FY{period.fiscal_year} "
@@ -819,6 +904,7 @@ def fetch_transcript(
         )
 
     if paths["txt"].exists() and not force:
+        refresh_transcript_meta(period, url=url, paths=paths)
         return paths["txt"]
 
     # Re-parse saved HTML when present (avoids re-hitting the site after failed validate)
@@ -844,19 +930,12 @@ def fetch_transcript(
     validate_transcript_text(extracted.text)
     paths["txt"].write_text(extracted.text, encoding="utf-8")
 
-    meta = {
-        "source": source_label(url),
-        "url": url,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "ticker": period.ticker,
-        "company_name": period.name,
-        "fiscal_year": period.fiscal_year,
-        "fiscal_quarter": f"Q{period.fiscal_quarter}",
-        "chars": len(extracted.text),
-        "call_date": extracted.call_date,
-        "call_participants": extracted.participants,
-        "raw_html": str(html_path),
-        "cleaned_txt": str(paths["txt"]),
-    }
-    paths["meta"].write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    write_transcript_meta(
+        period,
+        url=url,
+        paths=paths,
+        cleaned=extracted.text,
+        extracted=extracted,
+        html_path=html_path,
+    )
     return paths["txt"]

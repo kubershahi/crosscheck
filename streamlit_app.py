@@ -63,8 +63,17 @@ def _company_name(ticker: str, year: int, quarter: str) -> str:
         if report is not None:
             return report.company_name
     claims = claims_path(ticker, year, quarter)
+    legacy = claims.with_suffix(".json")
     if claims.exists():
-        data = json.loads(claims.read_text(encoding="utf-8"))
+        from crosscheck.io.jsonl import iter_json_objects
+
+        for row in iter_json_objects(claims):
+            name = row.get("company_name")
+            if name:
+                return str(name)
+            break
+    elif legacy.exists():
+        data = json.loads(legacy.read_text(encoding="utf-8"))
         return str(data.get("company_name") or ticker)
     return ticker
 
@@ -117,7 +126,8 @@ def main() -> None:
     company = _company_name(ticker, year, quarter)
     st.subheader(f"{company} ({ticker}) · FY{year} {quarter}")
 
-    has_claims = claims_path(ticker, year, quarter).exists()
+    claims_file = claims_path(ticker, year, quarter)
+    has_claims = claims_file.exists() or claims_file.with_suffix(".json").exists()
     has_report = report_path(ticker, year, quarter).exists()
     st.caption(
         f"Claims on disk: {'yes' if has_claims else 'no'} · "

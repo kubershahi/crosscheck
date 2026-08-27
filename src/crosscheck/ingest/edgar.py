@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -310,12 +310,51 @@ def download_primary_document(filing: dict[str, Any], dest: Path) -> Path:
     content = _get(url).content
     dest.write_bytes(content)
 
-    meta_path = dest.with_suffix(dest.suffix + ".meta.json")
-    meta_path.write_text(
-        json.dumps({**filing, "source_url": url}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_filing_meta(dest, {**filing, "source_url": url})
     return dest
+
+
+def filing_meta_path(dest: Path) -> Path:
+    """Sidecar path for a downloaded filing (``*.html.meta.json``)."""
+    return dest.with_suffix(dest.suffix + ".meta.json")
+
+
+def write_filing_meta(dest: Path, filing: dict[str, Any]) -> Path:
+    """Write / overwrite the filing sidecar ``.meta.json``."""
+    payload = {
+        **filing,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    meta_path = filing_meta_path(dest)
+    meta_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return meta_path
+
+
+def refresh_filing_meta(
+    dest: Path,
+    *,
+    ticker: str,
+    fiscal_year: int,
+    fiscal_quarter: int,
+    company_name: str | None = None,
+) -> Path:
+    """Rewrite sidecar meta from the on-disk filing + current period fields.
+
+    Does not hit EDGAR. Accession / source_url stay as previously downloaded.
+    """
+    meta_path = filing_meta_path(dest)
+    existing: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+    existing["ticker"] = ticker.upper()
+    existing["fiscal_year"] = str(fiscal_year)
+    existing["fiscal_quarter"] = f"Q{fiscal_quarter}"
+    if company_name:
+        existing["company_name"] = company_name
+    return write_filing_meta(dest, existing)
 
 
 def filing_filename(
@@ -347,12 +386,23 @@ def fetch_filing(
     company_name: str | None = None,
     force: bool = False,
 ) -> Path:
-    """Fetch a filing into ``data/raw/filings/{year}/{TICKER}/`` and return the path."""
+    """Fetch a filing into ``data/raw/filings/{year}/{TICKER}/`` and return the path.
+
+    Sidecar ``.meta.json`` is rewritten on every call (including skips).
+    ``force`` re-downloads the primary document from EDGAR.
+    """
     out_dir = filing_dir(ticker, fiscal_year)
     out_path = out_dir / filing_filename(
         ticker, form, fiscal_year, fiscal_quarter=fiscal_quarter
     )
     if out_path.exists() and not force:
+        refresh_filing_meta(
+            out_path,
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            fiscal_quarter=fiscal_quarter,
+            company_name=company_name,
+        )
         return out_path
 
     filing = find_filing(

@@ -46,9 +46,11 @@ companies (AAPL, MSFT, GOOGL, META, NVDA) with correct period-scoped hits.
 | Fetch | `scripts/fetch_corpus.py` | No | `data/raw/...` |
 | Chunk | `scripts/build_chunks.py` | No | `data/chunks/.../*.jsonl` |
 | Index | `scripts/build_indices.py` | No | `data/indices/{filings\|transcripts}/` |
-| Claims | `scripts/extract_claims.py` | Yes (1/period) | `data/claims/.../*_claims.json` |
+| Claims | `scripts/extract_claims.py` | Yes (1/period) | `data/claims/.../*_claims.jsonl` |
 | NLI | `scripts/run_nli.py` | Yes (1/claim) | `data/reports/...` + `data/runs/run_<ts>.csv` |
-| Golden candidates | `scripts/build_golden.py` | Yes (1/claim) | `data/eval/candidates.jsonl` (append/resume) |
+| Get eval candidates | `scripts/eval/get_eval_candidates.py` | Yes | `data/eval/claims/.../*_claims.jsonl` |
+| Verify eval candidates | `scripts/eval/verify_eval_candidates.py` | Yes (1/claim) | `data/eval/candidates/{year}/{TICKER}/` |
+| Promote eval candidates | `scripts/eval/promote_eval_candidates.py` | Yes (matches) | `data/eval/golden/{year}/{TICKER}/` |
 
 ---
 
@@ -59,7 +61,7 @@ companies (AAPL, MSFT, GOOGL, META, NVDA) with correct period-scoped hits.
 | Fetch + chunk | **Done** |
 | Embed + hybrid retrieve + rerank + NLI | **Done** |
 | Q1 2025 multi-ticker validation | **Done** (5 cos) |
-| Next (ship path) | Review `data/eval/candidates.jsonl` → promote to golden → eval harness |
+| Next (ship path) | Review `data/eval/golden/` → retrieval/NLI eval harness |
 
 ---
 
@@ -84,9 +86,18 @@ Optional:
 
 ```bash
 CROSSCHECK_LLM_PROFILE=development    # development | production (same model rank)
-CROSSCHECK_EMBEDDING_DEVICE=mps       # mps | cpu | cuda
+CROSSCHECK_EMBEDDING_DEVICE=mps       # local BGE-M3 embed (+ rerank fallback): mps|cpu|cuda
+CROSSCHECK_RERANK_BACKEND=pinecone    # pinecone (default) | local
+PINECONE_API_KEY=...                  # required for default Pinecone Inference rerank
 ```
 
+Dense embed (`BAAI/bge-m3`) stays **local** via sentence-transformers.
+Rerank (`bge-reranker-v2-m3`) defaults to **Pinecone Inference**, with local
+Torch/MPS fallback if the API call fails or `CROSSCHECK_RERANK_BACKEND=local`.
+
+```bash
+python scripts/build_indices.py --corpus filings --force --batch-size 32
+```
 ---
 
 ## Demo (Streamlit)
@@ -164,12 +175,11 @@ python scripts/sanity_chunks.py --ticker AAPL  # spot-check
 
 ```bash
 # Requires QDRANT_ENDPOINT + QDRANT_API_KEY in .env
-python scripts/build_indices.py --corpus filings --force --batch-size 8
-python scripts/build_indices.py --corpus transcripts --force --batch-size 8
+python scripts/build_indices.py --corpus filings --force --batch-size 32
+python scripts/build_indices.py --corpus transcripts --force --batch-size 32
 # or both:
-python scripts/build_indices.py --corpus both --force --batch-size 8
+python scripts/build_indices.py --corpus both --force
 ```
-
 **Filings** (`retrieval/index.py` + `retrieval/qdrant_store.py`):
 
 1. Merge company JSONL → `all_chunks.jsonl` with sequential `global_id`
@@ -211,22 +221,27 @@ python scripts/run_nli.py --ticker AAPL --year 2025 --quarter Q1
 python scripts/run_nli.py --year 2025            # all tickers that year
 python scripts/run_nli.py                        # all claims on disk
 python scripts/run_nli.py --ticker AAPL --no-rerank
-# --gap-seconds 10 between claim files (default; rate-limit spacing)
+# On HTTP 429 the LLM client sleeps 62s and retries (no proactive period gap)
 ```
 
 **Per claim:**
 
-1. **Filters** from claims **file header** (not the claim sentence):
-   `ticker`, `fiscal_year`, `fiscal_quarter`
-2. **Hybrid retrieve** — Qdrant Cloud dense + BM25 + RRF with period filters →
-   `pool_k`
-3. **Rerank** — `BAAI/bge-reranker-v2-m3` → `top_k` (default 5)
-4. **NLI** — Gemini judges Consistent / Contradictory / Unverifiable  
+1. **Query preprocess** (deterministic, no LLM) — expand `$N billion` →
+   `(N000 million)` for table match; for **Q4 claim periods only**, classify
+   temporal scope (full-year → 10-K / Q4-composite → dual 10-K+Q3 10-Q). Q1–Q3 stay
+   on standard 10-Q filters.
+2. **Filters** from claims **file header** (ticker, year) plus temporal plan;
+   claim-quarter used for standard Q1–Q3 10-Q retrieval
+3. **Hybrid retrieve** — Qdrant Cloud dense + BM25 + RRF → `pool_k`
+   (embed/BM25 use the *processed* query; rerank still uses raw claim text)
+4. **Rerank** — `BAAI/bge-reranker-v2-m3` → `top_k` (default 5)
+5. **NLI** — Gemini judges Consistent / Contradictory / Unverifiable  
    Citations (`retrieved_filing_passages`, `chunk_ids`, `global_ids`) filled from
    retrieval in code, not by the LLM. Passages are ranked (rerank score, best first).
 
-**Quarter match:** chunk `fiscal_period == Qn`; annual `FY` matches only when
-claim quarter is `Q4`.
+**Quarter match:** standard claims use chunk `fiscal_period == Qn`. Full-year
+claims target `10-K`/`FY`. Q4-composite claims run separate retrieval paths
+for `(10-K, FY)` and `(10-Q, Q3)`, preserving three passages from each.
 
 **NLI prompt context:** claim side gets ticker/company/year/quarter + speaker +
 claim; each passage gets ticker/company/period label/quarter months/section +
@@ -236,20 +251,24 @@ Output: `data/reports/{year}/{TICKER}/{TICKER}_FY{year}_Q{n}_reports.json`
 plus a run summary CSV: `data/runs/run_YYYYMMDD_HHMMSS.csv` (company +
 period tables with TOTAL rows).
 
-### 7 — Golden-set candidates
+### 7 — Eval candidates → golden set
 
-Same retrieve → rerank → NLI path as `run_nli`, but appends up to **5**
-candidates per ticker/year/quarter to `data/eval/candidates.jsonl` (append +
-fsync; development LLM profile; 12s gap between periods). Re-runs skip periods
-that already have ≥5 rows; periods with fewer are filled until 5.
+Labeled drafts live under `data/eval/claims/` (4 Consistent + 2 Contradictory +
+2 Unverifiable). Verify scores them with retrieve + NLI into
+`data/eval/candidates/`. Promote copies label-matching rows into
+`data/eval/golden/`.
+
+`run_nli.py` is unchanged — it still reads pure claims from `data/claims/`.
 
 ```bash
-python scripts/build_golden.py --year 2025
-python scripts/build_golden.py --ticker AAPL --year 2025 --quarter Q1
-# --force drops in-scope rows then regenerates up to 5/period
-```
+# first pass (get → verify → promote)
+python scripts/eval/run_eval_candidates.py --ticker AAPL --year 2025 --quarter Q1
 
-After review, copy selected rows to `data/eval/golden.jsonl`.
+# later: iterate one stage at a time
+python scripts/eval/get_eval_candidates.py --mode modify --ticker AAPL --year 2025 --quarter Q1
+python scripts/eval/verify_eval_candidates.py --mode modify --ticker AAPL --year 2025 --quarter Q1
+python scripts/eval/promote_eval_candidates.py --ticker AAPL --year 2025 --quarter Q1
+```
 
 ---
 
@@ -262,14 +281,17 @@ data/
     filings/{year}/{TICKER}/     # *.html + *.meta.json
     transcripts/{year}/{TICKER}/ # *.html, *.txt, *.meta.json
   chunks/{year}/{TICKER}/        # per-doc JSONL (stateless)
-  claims/{year}/{TICKER}/        # *_claims.json
+  claims/{year}/{TICKER}/        # *_claims.json (extract_claims / run_nli)
   indices/
     filings/                     # all_chunks.jsonl, embeddings.npy, manifest.json
     transcripts/                 # merge + embeddings scratch for Qdrant
     qdrant/                      # local path fallback if no QDRANT_ENDPOINT
   reports/{year}/{TICKER}/       # *_reports.json
   runs/                          # run_<timestamp>.csv NLI summaries
-  eval/                          # candidates.jsonl → golden.jsonl (manual)
+  eval/
+    claims/{year}/{TICKER}/      # labeled drafts (get_eval_candidates)
+    candidates/{year}/{TICKER}/  # retrieve+NLI scores (verify_eval_candidates)
+    golden/{year}/{TICKER}/      # curated golden set (promote_eval_candidates)
 ```
 
 Qdrant Cloud holds filings points (dense + BM25 + full payload). Set
@@ -316,6 +338,7 @@ Per model, modes: `STRUCTURED_OUTPUTS` → `JSON` → `TOOLS`. HTTP timeout 60s.
 | `src/crosscheck/chunking/transcripts.py` | Speaker-turn chunks |
 | `src/crosscheck/chunking/pipeline.py` | Chunk orchestration |
 | `src/crosscheck/retrieval/embeddings.py` | BGE-M3 + contextual headers |
+| `src/crosscheck/retrieval/query_processor.py` | Unit expansion + temporal scope for retrieve |
 | `src/crosscheck/retrieval/index.py` | Merge, embed, filings/transcripts → Qdrant |
 | `src/crosscheck/retrieval/qdrant_store.py` | Cloud client, upsert, hybrid query + filters |
 | `src/crosscheck/retrieval/hybrid.py` | Local BM25 helpers (legacy / transcripts path) |
