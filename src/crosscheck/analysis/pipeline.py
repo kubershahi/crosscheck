@@ -9,10 +9,14 @@ from crosscheck.analysis.nli import classify_claim
 from crosscheck.models import DocumentMeta, PipelineReport
 from crosscheck.retrieval.embeddings import load_embedding_model
 from crosscheck.retrieval.index import (
-    hybrid_retrieve,
     load_filings_index,
+    retrieve_claim_passages,
 )
-from crosscheck.retrieval.rerank import load_reranker, rerank_claim_passages
+from crosscheck.retrieval.query_processor import (
+    prepare_claim_query,
+    retrieval_path_log,
+)
+from crosscheck.retrieval.rerank import load_reranker
 
 
 def _preview(text: str, width: int = 64) -> str:
@@ -56,27 +60,23 @@ def run_pipeline(
     for i, claim in enumerate(saved_claims.claims, start=1):
         print(f"  claim {i}/{n_claims}", flush=True)
         print(f"    {_preview(claim.claim)}", flush=True)
-        print(f"    retrieve …", end=" ", flush=True)
+        plan = prepare_claim_query(
+            claim.claim, fiscal_quarter=period.fiscal_quarter
+        )
+        print(f"    {retrieval_path_log(plan)}", end=" ", flush=True)
 
-        retrieve_k = pool_k if use_reranker else top_k
-        hybrid_retrieved = hybrid_retrieve(
+        retrieved = retrieve_claim_passages(
             claim.claim,
             filings,
             model,
-            k=retrieve_k,
+            k=top_k,
             ticker=period.ticker,
             fiscal_year=period.fiscal_year,
             fiscal_quarter=period.fiscal_quarter,
+            rerank_pool_k=pool_k,
+            reranker=reranker,
+            use_reranker=use_reranker,
         )
-        retrieved = hybrid_retrieved
-        if use_reranker and reranker is not None:
-            print(f"rerank ({len(hybrid_retrieved)}) …", end=" ", flush=True)
-            retrieved = rerank_claim_passages(
-                claim.claim,
-                hybrid_retrieved,
-                top_k=top_k,
-                model=reranker,
-            )
         print(f"nli ({len(retrieved)} passages) …", flush=True)
 
         finding, nli_model, _matched = classify_claim(claim, retrieved, period=period)
@@ -87,6 +87,10 @@ def run_pipeline(
             f"confidence={finding.confidence_score:.2f}  model={nli_model}",
             flush=True,
         )
+        reason = " ".join(finding.reasoning.split())
+        if len(reason) > 220:
+            reason = reason[:219] + "…"
+        print(f"      reasoning: {reason}", flush=True)
         print(flush=True)
 
     llm_model_used = ", ".join(sorted(m for m in models_used if m != "none")) or "none"

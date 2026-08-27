@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from crosscheck.analysis.llm import complete_structured
 from crosscheck.analysis.prompts import NLI_SYSTEM, nli_user
 from crosscheck.models import (
@@ -12,6 +14,7 @@ from crosscheck.models import (
     IndexedChunk,
     NLIJudgment,
 )
+from crosscheck.retrieval.query_processor import prepare_claim_query
 
 
 def _passage_for_nli(chunk: Chunk) -> dict[str, str | None]:
@@ -42,20 +45,21 @@ def classify_claim(
     Passages in the finding are in retrieval/rerank order (best first).
     """
     passages = [_passage_for_nli(c) for c, _ in retrieved]
+    plan = prepare_claim_query(claim.claim, fiscal_quarter=period.fiscal_quarter)
+    user_content = nli_user(
+        claim=claim.claim,
+        speaker=claim.speaker,
+        ticker=period.ticker,
+        company_name=period.company_name,
+        fiscal_year=period.fiscal_year,
+        fiscal_quarter=period.fiscal_quarter,
+        passages=passages,
+    )
+    if plan.nli_instruction_suffix:
+        user_content = f"{user_content}\n\n{plan.nli_instruction_suffix}"
     messages = [
         {"role": "system", "content": NLI_SYSTEM},
-        {
-            "role": "user",
-            "content": nli_user(
-                claim=claim.claim,
-                speaker=claim.speaker,
-                ticker=period.ticker,
-                company_name=period.company_name,
-                fiscal_year=period.fiscal_year,
-                fiscal_quarter=period.fiscal_quarter,
-                passages=passages,
-            ),
-        },
+        {"role": "user", "content": user_content},
     ]
     judgment, model = complete_structured(
         response_model=NLIJudgment,
@@ -87,3 +91,28 @@ def classify_claim(
         reasoning=judgment.reasoning,
     )
     return finding, model, matched
+
+
+_PASSAGE_REF_RE = re.compile(r"[Pp]assage\s+(\d+)")
+
+
+def extract_passage_indices(
+    reasoning: str,
+    *,
+    primary_index: int,
+    n_passages: int,
+) -> list[int]:
+    """Return sorted unique 1-based passage indices referenced in NLI reasoning.
+
+    Always includes ``primary_index`` (the LLM's explicit pick).  Additional
+    indices are scraped from ``Passage N`` references in the text.  Values
+    outside 1..n_passages are dropped.
+    """
+    indices: set[int] = set()
+    if 1 <= primary_index <= n_passages:
+        indices.add(primary_index)
+    for m in _PASSAGE_REF_RE.finditer(reasoning or ""):
+        idx = int(m.group(1))
+        if 1 <= idx <= n_passages:
+            indices.add(idx)
+    return sorted(indices)
