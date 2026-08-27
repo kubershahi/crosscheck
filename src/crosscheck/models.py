@@ -35,6 +35,19 @@ def as_fiscal_quarter(value: object) -> FiscalQuarter:
     return f"Q{quarter_number(value)}"  # type: ignore[return-value]
 
 
+def make_claim_id(
+    ticker: str,
+    fiscal_year: int,
+    fiscal_quarter: int | str,
+    index: int,
+) -> str:
+    """Stable claim id matching candidates.jsonl, e.g. ``AAPL_2025_Q1_01``."""
+    if index < 1:
+        raise ValueError("claim index must be 1-based")
+    q = as_fiscal_quarter(fiscal_quarter)
+    return f"{ticker.upper()}_{int(fiscal_year)}_{q}_{index:02d}"
+
+
 class Chunk(BaseModel):
     """Stateless chunk unit — shared identity fields + corpus-specific optionals.
 
@@ -166,11 +179,78 @@ def make_chunk_id(
     return f"{ticker.upper()}_{fiscal_year}_{fiscal_period}_{doc_type}_chunk_{index}"
 
 
+Classification = Literal["Consistent", "Contradictory", "Unverifiable"]
+
+
 class FinancialClaim(BaseModel):
     """One testable financial assertion from an earnings call."""
 
     claim: str
     speaker: str
+    claim_id: str | None = Field(
+        default=None,
+        description="Stable id e.g. AAPL_2025_Q1_01; set on extract/eval/golden claims.",
+    )
+    intended_label: Classification | None = Field(
+        default=None,
+        description=(
+            "Optional golden-set intent: Consistent / Contradictory / Unverifiable. "
+            "Unset for ordinary extract_claims output."
+        ),
+    )
+    is_golden_claim: bool | None = Field(
+        default=None,
+        description=(
+            "True once promoted into the curated golden set; "
+            "False for eval/candidate claims; unset for ordinary extracts."
+        ),
+    )
+    regenerate: bool = Field(
+        default=False,
+        description=(
+            "When true, ``extract_claims.py --mode modify`` regenerates this claim "
+            "without duplicating other claims in the same period file."
+        ),
+    )
+
+
+class ClaimRewrite(BaseModel):
+    """LLM rewrite of a single claim (text + speaker only)."""
+
+    claim: str
+    speaker: str
+
+
+class GroundTruthReference(BaseModel):
+    """Short categorical filing reference for a golden claim."""
+
+    ground_truth_reference: str = Field(
+        description=(
+            "One-line categorical reference to the filing table/section/line "
+            "that verifies or contradicts the claim, including key figures."
+        ),
+    )
+
+
+class GoldenClaim(BaseModel):
+    """Curated golden-set claim promoted from matching candidates."""
+
+    claim_id: str
+    ticker: str
+    company_name: str
+    fiscal_year: int
+    fiscal_quarter: FiscalQuarter
+    speaker: str
+    claim: str
+    expected_nli_label: Classification
+    is_in_filing: bool
+    is_in_table: bool
+    ground_truth_reference: str
+
+    @field_validator("fiscal_quarter", mode="before")
+    @classmethod
+    def _normalize_fiscal_quarter(cls, value: object) -> FiscalQuarter:
+        return as_fiscal_quarter(value)
 
 
 class TranscriptClaimsList(BaseModel):
@@ -198,21 +278,32 @@ class SavedTranscriptClaims(BaseModel):
         return as_fiscal_quarter(value)
 
 
-Classification = Literal["Consistent", "Contradictory", "Unverifiable"]
-
-
 class NLIJudgment(BaseModel):
-    """LLM-only NLI decision fields (citations are filled from retrieval in code)."""
+    """LLM NLI decision. Field order matters for structured output: the model
+    fills fields in schema order — reason over the passages, then label, then
+    cite which passage the decision rested on.
+    """
 
-    classification: Classification
+    reasoning: str = Field(
+        description=(
+            "Step-by-step comparison of the claim against the passages; "
+            "write this before choosing the label."
+        ),
+    )
+    classification: Classification = Field(
+        description=(
+            "Final label after reasoning: Consistent, Contradictory, or "
+            "Unverifiable. Must match the reasoning above."
+        ),
+    )
     confidence_score: float = Field(ge=0.0, le=1.0)
-    reasoning: str
     matched_passage_index: int = Field(
         ge=0,
         le=20,
         description=(
-            "1-based index of the filing passage that best supports or "
-            "contradicts the claim; 0 if none of the passages are usable."
+            "1-based index of the filing passage that best supports the "
+            "classification above (the evidence cited in reasoning); "
+            "0 if none of the passages are usable."
         ),
     )
 
