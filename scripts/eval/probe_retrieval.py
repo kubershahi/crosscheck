@@ -33,6 +33,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.analysis.nli import classify_claim, extract_passage_indices  # noqa: E402
+from crosscheck.analysis.pipeline_options import (  # noqa: E402
+    add_retrieve_nli_arguments,
+    apply_retrieve_nli_options,
+)
 from crosscheck.config import EVAL_CLAIMS_DIR, EVAL_DIR  # noqa: E402
 from crosscheck.io.jsonl import (  # noqa: E402
     append_json_object,
@@ -158,7 +162,10 @@ def main() -> None:
         action="store_true",
         help="Disable cross-encoder reranking.",
     )
+    add_retrieve_nli_arguments(parser)
     args = parser.parse_args()
+
+    apply_retrieve_nli_options(reranker=args.reranker, nli_model=args.nli_model)
 
     os.environ["CROSSCHECK_LLM_PROFILE"] = "development"
 

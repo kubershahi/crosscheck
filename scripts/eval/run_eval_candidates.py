@@ -25,6 +25,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from crosscheck.analysis.pipeline_options import add_retrieve_nli_arguments  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 
 STEPS = (
@@ -46,6 +51,12 @@ def _forward_args(args: argparse.Namespace, *, include_profile: bool) -> list[st
         forwarded.append("--force")
     if include_profile and args.profile:
         forwarded.extend(["--profile", args.profile])
+    if getattr(args, "reranker", None):
+        forwarded.extend(["--reranker", args.reranker])
+    if getattr(args, "nli_model", None):
+        forwarded.extend(["--nli-model", args.nli_model])
+    if getattr(args, "no_rerank", False):
+        forwarded.append("--no-rerank")
     return forwarded
 
 
@@ -68,6 +79,7 @@ def main() -> None:
         choices=("development", "production", "test", "dev"),
         help="Forward CROSSCHECK_LLM_PROFILE override (get + promote).",
     )
+    add_retrieve_nli_arguments(parser)
     args = parser.parse_args()
 
     for index, (name, script) in enumerate(STEPS, start=1):

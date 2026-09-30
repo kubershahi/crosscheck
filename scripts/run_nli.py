@@ -43,6 +43,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from crosscheck.analysis.claims import load_saved_claims  # noqa: E402
 from crosscheck.analysis.pipeline import run_pipeline  # noqa: E402
+from crosscheck.analysis.pipeline_options import (  # noqa: E402
+    add_retrieve_nli_arguments,
+    apply_retrieve_nli_options,
+)
 from crosscheck.config import CLAIMS_DIR, RUNS_DIR, report_path  # noqa: E402
 from crosscheck.models import (  # noqa: E402
     DocumentMeta,
@@ -314,12 +318,15 @@ def main() -> None:
         action="store_true",
         help="Disable cross-encoder reranking.",
     )
+    add_retrieve_nli_arguments(parser)
     parser.add_argument(
         "--profile",
         choices=("development", "production", "test", "dev"),
         help="Override CROSSCHECK_LLM_PROFILE.",
     )
     args = parser.parse_args()
+
+    apply_retrieve_nli_options(reranker=args.reranker, nli_model=args.nli_model)
 
     if args.profile:
         profile = "development" if args.profile in {"test", "dev"} else args.profile
