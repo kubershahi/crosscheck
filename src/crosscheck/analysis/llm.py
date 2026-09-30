@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-from crosscheck.config import get_google_api_key, resolve_llm_models
+from crosscheck.config import effective_llm_models, get_google_api_key
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -203,7 +203,7 @@ def complete_structured(
 
     Returns (parsed_model, model_id_used).
     """
-    models = resolve_llm_models()
+    models = effective_llm_models()
     if not models:
         raise RuntimeError("No LLM models configured")
     primary = models[0]

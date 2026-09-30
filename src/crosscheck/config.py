@@ -47,6 +47,9 @@ REPORTS_DIR = DATA_DIR / "reports"
 RUNS_DIR = DATA_DIR / "runs"
 EVAL_DIR = DATA_DIR / "eval"
 EVAL_CLAIMS_DIR = EVAL_DIR / "claims"
+EVAL_GOLDEN_DIR = EVAL_DIR / "golden"
+GOLDEN_REPORTS_DIR = REPORTS_DIR / "golden"
+GOLDEN_RUNS_DIR = RUNS_DIR / "golden"
 MANIFESTS_DIR = DATA_DIR / "manifests"
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -193,6 +196,16 @@ def report_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Pat
     return REPORTS_DIR / str(fiscal_year) / ticker / name
 
 
+def golden_report_path(ticker: str, fiscal_year: int, fiscal_quarter: int | str) -> Path:
+    """Return ``data/reports/golden/{year}/{TICKER}/…_golden_eval.json``."""
+    from crosscheck.models import as_fiscal_quarter
+
+    ticker = ticker.upper()
+    q = as_fiscal_quarter(fiscal_quarter)
+    name = f"{ticker}_FY{fiscal_year}_{q}_golden_eval.json"
+    return GOLDEN_REPORTS_DIR / str(fiscal_year) / ticker / name
+
+
 def get_embedding_device_pref() -> str:
     """Return preferred local embed/rerank device: ``mps``, ``cuda``, or ``cpu``."""
     return os.getenv("CROSSCHECK_EMBEDDING_DEVICE", "mps").strip().lower()
@@ -237,6 +250,25 @@ def get_llm_profile() -> Literal["development", "production"]:
 def resolve_llm_models() -> list[str]:
     """Return ranked Gemini model ids (same order for development and production)."""
     return list(LLM_MODEL_RANK)
+
+
+_llm_model_override: list[str] | None = None
+
+
+def set_llm_model_override(models: list[str] | None) -> None:
+    """Override Gemini model rank for this process (``None`` clears)."""
+    global _llm_model_override
+    _llm_model_override = list(models) if models else None
+
+
+def clear_llm_model_override() -> None:
+    set_llm_model_override(None)
+
+
+def effective_llm_models() -> list[str]:
+    if _llm_model_override:
+        return list(_llm_model_override)
+    return resolve_llm_models()
 
 
 def get_google_api_key() -> str:
