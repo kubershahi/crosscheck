@@ -15,7 +15,7 @@ Q1–Q3 claims search that quarter’s 10-Q. Q4 claims use two stacks: the FY 10
 
 Evaluated on FY2025 Q1–Q4 for AAPL, AMZN, GOOGL, META, and NVDA.
 
-![Mac revenue claim retrieved from a 10-Q, 10-K, and table, then verified as Consistent, Contradictory, or Unverifiable](assets/project-overview.jpg)
+![Crosscheck overview: corpus build, per-claim hybrid retrieval and Gemini NLI on an AAPL Mac revenue claim, and golden eval metrics](assets/project-overview.png)
 
 ## Project structure
 
