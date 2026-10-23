@@ -1,5 +1,15 @@
 # Crosscheck
 
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Tests](https://img.shields.io/badge/Tests-pytest-0A9EDC?logo=pytest&logoColor=white)
+![Data](https://img.shields.io/badge/Data-SEC%20EDGAR-1F3B73)
+![Vector DB](https://img.shields.io/badge/Vector%20DB-Qdrant-DC244C?logo=qdrant&logoColor=white)
+![Embeddings](https://img.shields.io/badge/Embeddings-BGE--M3-FFB000?logo=huggingface&logoColor=white)
+![Reranker](https://img.shields.io/badge/Reranker-Pinecone-000000)
+![LLM](https://img.shields.io/badge/LLM-Gemini-8E75B2?logo=googlegemini&logoColor=white)
+![Demo](https://img.shields.io/badge/Demo-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
+
 Cross-document RAG that checks earnings-call claims against the same company-quarter’s SEC filing.
 
 Executives describe results on a call; the 10-Q or 10-K states them in audited tables. Crosscheck retrieves filing passages for each claim and classifies the pair as **Consistent**, **Contradictory**, or **Unverifiable**, with citations, confidence, and reasoning. Retrieval and the NLI label are scored separately on a 160-claim golden set.
